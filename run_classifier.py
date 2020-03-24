@@ -123,6 +123,10 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
+flags.DEFINE_integer(
+    "num_gpu_cores", 2,
+    "OTotal number of GPU cores to use.")
+
 
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
@@ -901,22 +905,6 @@ def main(_):
     tokenizer = tokenization.FullTokenizer(
         vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
-    tpu_cluster_resolver = None
-    if FLAGS.use_tpu and FLAGS.tpu_name:
-        tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-            FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
-    is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-    run_config = tf.contrib.tpu.RunConfig(
-        cluster=tpu_cluster_resolver,
-        master=FLAGS.master,
-        model_dir=FLAGS.output_dir,
-        save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-        tpu_config=tf.contrib.tpu.TPUConfig(
-            iterations_per_loop=FLAGS.iterations_per_loop,
-            num_shards=FLAGS.num_tpu_cores,
-            per_host_input_for_training=is_per_host))
-
     train_examples = None
     num_train_steps = None
     num_warmup_steps = None
@@ -936,15 +924,58 @@ def main(_):
         use_tpu=FLAGS.use_tpu,
         use_one_hot_embeddings=FLAGS.use_tpu)
 
-    # If TPU is not available, this will fall back to normal Estimator on CPU
-    # or GPU.
-    estimator = tf.contrib.tpu.TPUEstimator(
-        use_tpu=FLAGS.use_tpu,
-        model_fn=model_fn,
-        config=run_config,
-        train_batch_size=FLAGS.train_batch_size,
-        eval_batch_size=FLAGS.eval_batch_size,
-        predict_batch_size=FLAGS.predict_batch_size)
+    if FLAGS.use_tpu and FLAGS.tpu_name:
+        tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+            FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+
+        is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+        run_config = tf.contrib.tpu.RunConfig(
+            cluster=tpu_cluster_resolver,
+            master=FLAGS.master,
+            model_dir=FLAGS.output_dir,
+            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+            tpu_config=tf.contrib.tpu.TPUConfig(
+                iterations_per_loop=FLAGS.iterations_per_loop,
+                num_shards=FLAGS.num_tpu_cores,
+                per_host_input_for_training=is_per_host))
+
+        # If TPU is not available, this will fall back to normal Estimator on CPU
+        # or GPU.
+        estimator = tf.contrib.tpu.TPUEstimator(
+            use_tpu=FLAGS.use_tpu,
+            model_fn=model_fn,
+            config=run_config,
+            train_batch_size=FLAGS.train_batch_size,
+            eval_batch_size=FLAGS.eval_batch_size,
+            predict_batch_size=FLAGS.predict_batch_size)
+
+    else:
+        # 1.先定义分布式训练的镜像策略：MirroredStrategy
+        dist_strategy = tf.contrib.distribute.MirroredStrategy(
+            num_gpus=FLAGS.num_gpu_cores,  # 使用gpu的个数
+            # cross_device_ops=AllReduceCrossDeviceOps('nccl', num_packs=FLAGS.num_gpu_cores),  # 各设备之间的数据操作方式
+            # cross_device_ops=AllReduceCrossDeviceOps('hierarchical_copy'),
+        )
+        # 2.设置会话session配置
+        session_config = tf.ConfigProto(
+            inter_op_parallelism_threads=0,
+            intra_op_parallelism_threads=0,
+            allow_soft_placement=True,
+            gpu_options=tf.GPUOptions(allow_growth=True))
+
+        # 3.设置运行配置run_config
+        run_config = tf.contrib.tpu.RunConfig(
+            train_distribute=dist_strategy,
+            eval_distribute=dist_strategy,
+            model_dir=FLAGS.output_dir,
+            session_config=session_config,
+            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+            keep_checkpoint_max=15)
+        # 4.构造CPU、GPU评估器对象
+        estimator = tf.estimator.Estimator(
+            model_fn=model_fn,
+            config=run_config,
+            params={"batch_size": FLAGS.train_batch_size})
 
     if FLAGS.do_train:
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
