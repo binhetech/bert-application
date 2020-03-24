@@ -1,2 +1,4 @@
 __pycache__/
 *.log
+.idea/
+.DS_Store
