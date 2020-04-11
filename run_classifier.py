@@ -25,6 +25,8 @@ import modeling
 import optimization
 import tokenization
 import tensorflow as tf
+from tensorflow.contrib.distribute import AllReduceCrossDeviceOps
+from tensorflow.python.client import device_lib
 
 flags = tf.flags
 
@@ -891,6 +893,9 @@ def main(_):
             "was only trained up to sequence length %d" %
             (FLAGS.max_seq_length, bert_config.max_position_embeddings))
 
+    local_device_protos = device_lib.list_local_devices()
+    FLAGS.num_gpu_cores = min(sum([1 for d in local_device_protos if d.device_type == 'GPU']), FLAGS.num_gpu_cores)
+
     tf.gfile.MakeDirs(FLAGS.output_dir)
 
     task_name = FLAGS.task_name.lower()
@@ -949,11 +954,12 @@ def main(_):
             eval_batch_size=FLAGS.eval_batch_size,
             predict_batch_size=FLAGS.predict_batch_size)
 
-    else:
+    elif FLAGS.num_gpu_cores > 1:
+        # multi-gpus 训练
         # 1.先定义分布式训练的镜像策略：MirroredStrategy
         dist_strategy = tf.contrib.distribute.MirroredStrategy(
             num_gpus=FLAGS.num_gpu_cores,  # 使用gpu的个数
-            # cross_device_ops=AllReduceCrossDeviceOps('nccl', num_packs=FLAGS.num_gpu_cores),  # 各设备之间的数据操作方式
+            cross_device_ops=AllReduceCrossDeviceOps('nccl', num_packs=FLAGS.num_gpu_cores),  # 各设备之间的数据操作方式
             # cross_device_ops=AllReduceCrossDeviceOps('hierarchical_copy'),
         )
         # 2.设置会话session配置
@@ -976,6 +982,29 @@ def main(_):
             model_fn=model_fn,
             config=run_config,
             params={"batch_size": FLAGS.train_batch_size})
+    else:
+        # 单GPU或者CPU训练
+        tpu_cluster_resolver = None
+        is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+        run_config = tf.contrib.tpu.RunConfig(
+            cluster=tpu_cluster_resolver,
+            master=FLAGS.master,
+            model_dir=FLAGS.output_dir,
+            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+            tpu_config=tf.contrib.tpu.TPUConfig(
+                iterations_per_loop=FLAGS.iterations_per_loop,
+                num_shards=FLAGS.num_tpu_cores,
+                per_host_input_for_training=is_per_host))
+
+        # If TPU is not available, this will fall back to normal Estimator on CPU
+        # or GPU.
+        estimator = tf.contrib.tpu.TPUEstimator(
+            use_tpu=FLAGS.use_tpu,
+            model_fn=model_fn,
+            config=run_config,
+            train_batch_size=FLAGS.train_batch_size,
+            eval_batch_size=FLAGS.eval_batch_size,
+            predict_batch_size=FLAGS.predict_batch_size)
 
     if FLAGS.do_train:
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")

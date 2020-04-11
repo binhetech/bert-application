@@ -12,9 +12,10 @@ nohup python3 ../run_classifier.py \
   --bert_config_file=$BERT_BASE_DIR/bert_config.json \
   --init_checkpoint=$BERT_BASE_DIR/bert_model.ckpt \
   --max_seq_length=512 \
-  --train_batch_size=64 \
+  --train_batch_size=128 \
   --learning_rate=2e-5 \
   --num_train_epochs=5 \
+  --num_gpu_cores=1 \
   --do_lower_case=False \
   --output_dir=../fine_tuned/sed \
   | tee run_classifier.log
