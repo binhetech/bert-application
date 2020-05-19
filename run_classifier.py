@@ -23,10 +23,12 @@ import csv
 import os
 import modeling
 import optimization
+import custom_optimization
 import tokenization
 import tensorflow as tf
 from tensorflow.contrib.distribute import AllReduceCrossDeviceOps
 from tensorflow.python.client import device_lib
+from tensorflow.contrib import *
 
 flags = tf.flags
 
@@ -128,6 +130,7 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     "num_gpu_cores", 2,
     "OTotal number of GPU cores to use.")
+flags.DEFINE_bool("use_fp16", False, "Whether to use fp16.")
 
 
 class InputExample(object):
@@ -200,7 +203,7 @@ class DataProcessor(object):
         raise NotImplementedError()
 
     @classmethod
-    def _read_tsv(cls, input_file, quotechar=None):
+    def _read_tsv(cls, input_file, quotechar='"'):
         """Reads a tab separated value file."""
         with tf.gfile.Open(input_file, "r") as f:
             reader = csv.reader(f, delimiter="\t", quotechar=quotechar)
@@ -416,6 +419,89 @@ class SedProcessor(DataProcessor):
             else:
                 text_a = tokenization.convert_to_unicode(line[1])
                 label = tokenization.convert_to_unicode(line[0])
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+        return examples
+
+
+class TopicRelProcessor(DataProcessor):
+    """Processor for the sentence-level error detection(SED) data set (GLUE version)."""
+
+    def get_train_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "test.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+
+    def get_labels(self):
+        """See base class."""
+        return ["0.0", "1.0", "2.0", "3.0"]
+
+    def _create_examples(self, lines, set_type):
+        """Creates examples for the training and dev sets."""
+        examples = []
+        for (i, line) in enumerate(lines):
+            if i <= 3:
+                print("i={}, line={}".format(i, line))
+            # Only the test set has a header
+            if i == 0:
+                continue
+            guid = "%s-%s" % (set_type, i)
+            if set_type == "test":
+                text_a = tokenization.convert_to_unicode(line[0])
+                label = "3.0"
+            else:
+                text_a = tokenization.convert_to_unicode(line[0])
+                label = tokenization.convert_to_unicode(line[1])
+            examples.append(InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+        return examples
+
+
+class GarbledSentsProcessor(DataProcessor):
+    """Processor for the sentence-level error detection(SED) data set (GLUE version)."""
+
+    def get_train_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+
+    def get_dev_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "test.tsv")), "dev")
+
+    def get_test_examples(self, data_dir):
+        """See base class."""
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+
+    def get_labels(self):
+        """See base class."""
+        return ["0.0", "1.0"]
+
+    def _create_examples(self, lines, set_type):
+        """Creates examples for the training and dev sets."""
+        examples = []
+        for (i, line) in enumerate(lines):
+            if i <= 3:
+                print("i={}, line={}".format(i, line))
+            if i == 0:
+                continue
+            guid = "%s-%s" % (set_type, i)
+            if set_type == "test":
+                text_a = tokenization.convert_to_unicode(line[0])
+                label = "1.0"
+            else:
+                text_a = tokenization.convert_to_unicode(line[0])
+                label = tokenization.convert_to_unicode(line[1])
             examples.append(InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
         return examples
 
@@ -704,7 +790,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
 
 def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings):
+                     use_one_hot_embeddings, fp16=FLAGS.use_fp16):
     """Returns `model_fn` closure for TPUEstimator."""
 
     def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -756,15 +842,24 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
 
         output_spec = None
         if mode == tf.estimator.ModeKeys.TRAIN:
+            if FLAGS.num_gpu_cores > 1:
+                train_op = custom_optimization.create_optimizer(
+                    total_loss, learning_rate, num_train_steps, num_warmup_steps, fp16=fp16)
 
-            train_op = optimization.create_optimizer(
-                total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+                output_spec = tf.estimator.EstimatorSpec(
+                    mode=mode,
+                    loss=total_loss,
+                    train_op=train_op,
+                    scaffold=scaffold_fn)
+            else:
+                train_op = optimization.create_optimizer(
+                    total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
 
-            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-                mode=mode,
-                loss=total_loss,
-                train_op=train_op,
-                scaffold_fn=scaffold_fn)
+                output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                    mode=mode,
+                    loss=total_loss,
+                    train_op=train_op,
+                    scaffold_fn=scaffold_fn)
         elif mode == tf.estimator.ModeKeys.EVAL:
 
             def metric_fn(per_example_loss, label_ids, logits, is_real_example):
@@ -785,10 +880,15 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                 eval_metrics=eval_metrics,
                 scaffold_fn=scaffold_fn)
         else:
-            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-                mode=mode,
-                predictions={"probabilities": probabilities},
-                scaffold_fn=scaffold_fn)
+            if FLAGS.num_gpu_cores > 1:
+                output_spec = tf.estimator.EstimatorSpec(
+                    mode=mode,
+                    predictions={"probabilities": probabilities})
+            else:
+                output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                    mode=mode,
+                    predictions={"probabilities": probabilities},
+                    scaffold_fn=scaffold_fn)
         return output_spec
 
     return model_fn
@@ -876,6 +976,8 @@ def main(_):
         "xnli": XnliProcessor,
         "disc": DiscProcessor,
         "sed": SedProcessor,
+        "topicrel": TopicRelProcessor,
+        "garbledsents": GarbledSentsProcessor
     }
 
     tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case,
@@ -894,7 +996,8 @@ def main(_):
             (FLAGS.max_seq_length, bert_config.max_position_embeddings))
 
     local_device_protos = device_lib.list_local_devices()
-    FLAGS.num_gpu_cores = min(sum([1 for d in local_device_protos if d.device_type == 'GPU']), FLAGS.num_gpu_cores)
+    # FLAGS.num_gpu_cores = min(sum([1 for d in local_device_protos if d.device_type == 'GPU']), FLAGS.num_gpu_cores)
+    tf.logging.info(f"Info: {FLAGS.num_gpu_cores} GPUs found")
 
     tf.gfile.MakeDirs(FLAGS.output_dir)
 
@@ -930,6 +1033,7 @@ def main(_):
         use_one_hot_embeddings=FLAGS.use_tpu)
 
     if FLAGS.use_tpu and FLAGS.tpu_name:
+        tf.logging.info(f"***** {FLAGS.tpu_name} TPU Running *****")
         tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
             FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
@@ -956,6 +1060,7 @@ def main(_):
 
     elif FLAGS.num_gpu_cores > 1:
         # multi-gpus 训练
+        tf.logging.info(f"***** {FLAGS.num_gpu_cores} GPUs Running *****")
         # 1.先定义分布式训练的镜像策略：MirroredStrategy
         dist_strategy = tf.contrib.distribute.MirroredStrategy(
             num_gpus=FLAGS.num_gpu_cores,  # 使用gpu的个数
@@ -984,6 +1089,7 @@ def main(_):
             params={"batch_size": FLAGS.train_batch_size})
     else:
         # 单GPU或者CPU训练
+        tf.logging.info("***** Single GPU/CPU Running *****")
         tpu_cluster_resolver = None
         is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
         run_config = tf.contrib.tpu.RunConfig(
@@ -1020,6 +1126,7 @@ def main(_):
             is_training=True,
             drop_remainder=True)
         estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
+        tf.logging.info("***** Training completed*****")
 
     if FLAGS.do_eval:
         eval_examples = processor.get_dev_examples(FLAGS.data_dir)
@@ -1066,6 +1173,7 @@ def main(_):
             for key in sorted(result.keys()):
                 tf.logging.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
+        tf.logging.info("***** Evaluation completed*****")
 
     if FLAGS.do_predict:
         predict_examples = processor.get_test_examples(FLAGS.data_dir)
@@ -1112,6 +1220,7 @@ def main(_):
                 writer.write(output_line)
                 num_written_lines += 1
         assert num_written_lines == num_actual_predict_examples
+        tf.logging.info("***** Prediction completed*****")
 
 
 if __name__ == "__main__":
