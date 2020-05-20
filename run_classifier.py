@@ -29,6 +29,7 @@ import tensorflow as tf
 from tensorflow.contrib.distribute import AllReduceCrossDeviceOps
 from tensorflow.python.client import device_lib
 from tensorflow.contrib import *
+from sklearn.metrics import f1_score
 
 flags = tf.flags
 
@@ -449,11 +450,11 @@ class TopicRelProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i <= 3:
-                print("i={}, line={}".format(i, line))
-            # Only the test set has a header
+            # ignore first header line
             if i == 0:
                 continue
+            if i <= 3:
+                print("i={}, line={}".format(i, line))
             guid = "%s-%s" % (set_type, i)
             if set_type == "test":
                 text_a = tokenization.convert_to_unicode(line[0])
@@ -466,7 +467,7 @@ class TopicRelProcessor(DataProcessor):
 
 
 class GarbledSentsProcessor(DataProcessor):
-    """Processor for the sentence-level error detection(SED) data set (GLUE version)."""
+    """Processor for the garbled sentence data set."""
 
     def get_train_examples(self, data_dir):
         """See base class."""
@@ -476,7 +477,7 @@ class GarbledSentsProcessor(DataProcessor):
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.tsv")), "dev")
+            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
@@ -491,10 +492,11 @@ class GarbledSentsProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for (i, line) in enumerate(lines):
-            if i <= 3:
-                print("i={}, line={}".format(i, line))
+            # ignore first header line
             if i == 0:
                 continue
+            if i <= 3:
+                print("i={}, line={}".format(i, line))
             guid = "%s-%s" % (set_type, i)
             if set_type == "test":
                 text_a = tokenization.convert_to_unicode(line[0])
@@ -557,7 +559,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
             segment_ids=[0] * max_seq_length,
             label_id=0,
             is_real_example=False)
-
+    # 构建标签文本-索引id
     label_map = {}
     for (i, label) in enumerate(label_list):
         label_map[label] = i
@@ -628,6 +630,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
     assert len(input_mask) == max_seq_length
     assert len(segment_ids) == max_seq_length
 
+    # 根据标签文本转换为标签索引id， 所以输入的都是标签列表的(get_labels()函数)索引id，最后预测argmax也是索引id
     label_id = label_map[example.label]
     if ex_index < 5:
         tf.logging.info("*** Example ***")
@@ -867,27 +870,49 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                 accuracy = tf.metrics.accuracy(
                     labels=label_ids, predictions=predictions, weights=is_real_example)
                 loss = tf.metrics.mean(values=per_example_loss, weights=is_real_example)
+                # add more metrics
+                pr, pr_op = tf.metrics.precision(
+                    labels=label_ids, predictions=predictions, weights=is_real_example)
+                re, re_op = tf.metrics.recall(
+                    labels=label_ids, predictions=predictions, weights=is_real_example)
+                # f1 = (2 * pr * re) / (pr + re)  # f1-score for binary classification
+                # print("label_ids={}, predictions={}".format(label_ids, predictions))
+                # print("label_ids={}, predictions={}".format(label_ids, predictions.cpu()))
                 return {
                     "eval_accuracy": accuracy,
                     "eval_loss": loss,
+                    "eval_precision": (pr, pr_op),
+                    "eval_recall": (re, re_op),
+                    "eval_f1_score": tf.contrib.metrics.f1_score(label_ids, predictions),
+                    "eval_f1_macro": tf.contrib.metrics.f1_score(label_ids, predictions, weights=is_real_example),
                 }
 
             eval_metrics = (metric_fn,
                             [per_example_loss, label_ids, logits, is_real_example])
-            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-                mode=mode,
-                loss=total_loss,
-                eval_metrics=eval_metrics,
-                scaffold_fn=scaffold_fn)
-        else:
             if FLAGS.num_gpu_cores > 1:
                 output_spec = tf.estimator.EstimatorSpec(
                     mode=mode,
-                    predictions={"probabilities": probabilities})
+                    loss=total_loss,
+                    eval_metric_ops=metric_fn(per_example_loss, label_ids, logits, is_real_example),
+                    scaffold=scaffold_fn,
+                )
+            else:
+                # eval on single-gpu only
+                output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                    mode=mode,
+                    loss=total_loss,
+                    eval_metrics=eval_metrics,
+                    scaffold_fn=scaffold_fn)
+        else:
+            predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
+            if FLAGS.num_gpu_cores > 1:
+                output_spec = tf.estimator.EstimatorSpec(
+                    mode=mode,
+                    predictions={"probabilities": probabilities, "predictions": predictions})
             else:
                 output_spec = tf.contrib.tpu.TPUEstimatorSpec(
                     mode=mode,
-                    predictions={"probabilities": probabilities},
+                    predictions={"probabilities": probabilities, "predictions": predictions},
                     scaffold_fn=scaffold_fn)
         return output_spec
 
@@ -1007,7 +1032,7 @@ def main(_):
         raise ValueError("Task not found: %s" % (task_name))
 
     processor = processors[task_name]()
-
+    # 获取标签列表
     label_list = processor.get_labels()
 
     tokenizer = tokenization.FullTokenizer(
@@ -1212,12 +1237,16 @@ def main(_):
             tf.logging.info("***** Predict results *****")
             for (i, prediction) in enumerate(result):
                 probabilities = prediction["probabilities"]
+                # 根据输出的索引id找到对应的label
+                y_pred = label_list[prediction["predictions"]]
+                if i <= 3:
+                    print(f"probabilities={probabilities}")
+                    print("y_pred={}".format(y_pred))
                 if i >= num_actual_predict_examples:
                     break
-                output_line = "\t".join(
-                    str(class_probability)
-                    for class_probability in probabilities) + "\n"
-                writer.write(output_line)
+                # output_line = "\t".join(
+                #     [str(class_probability) for class_probability in probabilities] + [str(y_pred)]) + "\n"
+                writer.write(str(y_pred) + "\n")
                 num_written_lines += 1
         assert num_written_lines == num_actual_predict_examples
         tf.logging.info("***** Prediction completed*****")
