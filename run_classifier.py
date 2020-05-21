@@ -486,7 +486,7 @@ class GarbledSentsProcessor(DataProcessor):
 
     def get_labels(self):
         """See base class."""
-        return ["0.0", "1.0"]
+        return ["0", "1"]
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
@@ -500,7 +500,7 @@ class GarbledSentsProcessor(DataProcessor):
             guid = "%s-%s" % (set_type, i)
             if set_type == "test":
                 text_a = tokenization.convert_to_unicode(line[0])
-                label = "1.0"
+                label = "0"
             else:
                 text_a = tokenization.convert_to_unicode(line[0])
                 label = tokenization.convert_to_unicode(line[1])
@@ -632,11 +632,10 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
 
     # 根据标签文本转换为标签索引id， 所以输入的都是标签列表的(get_labels()函数)索引id，最后预测argmax也是索引id
     label_id = label_map[example.label]
-    if ex_index < 5:
+    if ex_index < 3:
         tf.logging.info("*** Example ***")
         tf.logging.info("guid: %s" % (example.guid))
-        tf.logging.info("tokens: %s" % " ".join(
-            [tokenization.printable_text(x) for x in tokens]))
+        tf.logging.info("tokens: %s" % " ".join([tokenization.printable_text(x) for x in tokens]))
         tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
         tf.logging.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
         tf.logging.info("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
@@ -875,7 +874,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                     labels=label_ids, predictions=predictions, weights=is_real_example)
                 re, re_op = tf.metrics.recall(
                     labels=label_ids, predictions=predictions, weights=is_real_example)
-                # f1 = (2 * pr * re) / (pr + re)  # f1-score for binary classification
+                # f1, f1_op = (2 * pr * re) / (pr + re)  # f1-score for binary classification
                 # print("label_ids={}, predictions={}".format(label_ids, predictions))
                 # print("label_ids={}, predictions={}".format(label_ids, predictions.cpu()))
                 return {
@@ -883,8 +882,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                     "eval_loss": loss,
                     "eval_precision": (pr, pr_op),
                     "eval_recall": (re, re_op),
-                    "eval_f1_score": tf.contrib.metrics.f1_score(label_ids, predictions),
-                    "eval_f1_macro": tf.contrib.metrics.f1_score(label_ids, predictions, weights=is_real_example),
+                    "eval_f1": tf.contrib.metrics.f1_score(label_ids, predictions),
                 }
 
             eval_metrics = (metric_fn,
@@ -1020,7 +1018,7 @@ def main(_):
             "was only trained up to sequence length %d" %
             (FLAGS.max_seq_length, bert_config.max_position_embeddings))
 
-    local_device_protos = device_lib.list_local_devices()
+    # local_device_protos = device_lib.list_local_devices()
     # FLAGS.num_gpu_cores = min(sum([1 for d in local_device_protos if d.device_type == 'GPU']), FLAGS.num_gpu_cores)
     tf.logging.info(f"Info: {FLAGS.num_gpu_cores} GPUs found")
 
