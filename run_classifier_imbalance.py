@@ -106,6 +106,8 @@ flags.DEFINE_integer("iterations_per_loop", 1000,
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
+flags.DEFINE_string("class_weight", "balanced", "Whether to use class weight(balanced or None).")
+
 tf.flags.DEFINE_string(
     "tpu_name", None,
     "The Cloud TPU to use for training. This should be either the name "
@@ -683,13 +685,13 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
 
 
 def file_based_convert_examples_to_features(
-        examples, label_list, max_seq_length, tokenizer, output_file, is_training):
+        examples, label_list, max_seq_length, tokenizer, output_file, is_training, class_weight):
     """Convert a set of `InputExample`s to a TFRecord file."""
 
     writer = tf.python_io.TFRecordWriter(output_file)
 
-    if is_training:
-        class_weight = get_examples_class_weight(examples, "balanced", label_list)
+    if is_training and class_weight == "balanced":
+        class_weight = get_examples_class_weight(examples, class_weight, label_list)
     else:
         class_weight = [1.0] * len(label_list)
 
@@ -1188,7 +1190,7 @@ def main(_):
     if FLAGS.do_train:
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
         file_based_convert_examples_to_features(
-            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file, True)
+            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file, True, FLAGS.class_weight)
         tf.logging.info("***** Running training *****")
         tf.logging.info("  Num examples = %d", len(train_examples))
         tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
@@ -1215,7 +1217,7 @@ def main(_):
 
         eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
         file_based_convert_examples_to_features(
-            eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, False)
+            eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, False, FLAGS.class_weight)
 
         tf.logging.info("***** Running evaluation *****")
         tf.logging.info("  Num examples = %d (%d actual, %d padding)",
@@ -1262,7 +1264,7 @@ def main(_):
         predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
         file_based_convert_examples_to_features(predict_examples, label_list,
                                                 FLAGS.max_seq_length, tokenizer,
-                                                predict_file, False)
+                                                predict_file, False, FLAGS.class_weight)
 
         tf.logging.info("***** Running prediction*****")
         tf.logging.info("  Num examples = %d (%d actual, %d padding)",
