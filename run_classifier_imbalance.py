@@ -725,6 +725,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
                                 drop_remainder, num_labels):
     """Creates an `input_fn` closure to be passed to TPUEstimator."""
 
+    # 特征列匹配
     name_to_features = {
         "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
         "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
@@ -735,11 +736,16 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
     }
 
     def _decode_record(record, name_to_features):
-        """Decodes a record to a TensorFlow example."""
+        """
+        Decodes a record to a TensorFlow example.
+        解析tf.record文件数据
+        """
+        # 解析单个样本
         example = tf.parse_single_example(record, name_to_features)
 
         # tf.Example only supports tf.int64, but the TPU only supports tf.int32.
         # So cast all int64 to int32.
+        # 将样本中int64数据类型转换为int32
         for name in list(example.keys()):
             t = example[name]
             if t.dtype == tf.int64:
@@ -769,6 +775,32 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
         return d
 
     return input_fn
+
+def serving_input_receiver_fn(seq_length, num_labels):
+    """
+    Serving input_fn that builds features from placeholders.
+
+    Returns
+    -------
+    tf.estimator.export.ServingInputReceiver
+    """
+    features = {
+        "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
+        "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "label_ids": tf.FixedLenFeature([], tf.int64),
+        "label_weights": tf.FixedLenFeature([num_labels], tf.float32),
+        "is_real_example": tf.FixedLenFeature([], tf.int64),
+    }
+    receiver_tensors = {
+        "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
+        "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
+        "label_ids": tf.FixedLenFeature([], tf.int64),
+        "label_weights": tf.FixedLenFeature([num_labels], tf.float32),
+        "is_real_example": tf.FixedLenFeature([], tf.int64),
+    }
+    return tf.estimator.export.ServingInputReceiver(features, receiver_tensors)
 
 
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
@@ -1084,6 +1116,7 @@ def main(_):
     processor = processors[task_name]()
     # 获取标签列表
     label_list = processor.get_labels()
+    num_labels = len(label_list)
 
     tokenizer = tokenization.FullTokenizer(
         vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
@@ -1202,6 +1235,9 @@ def main(_):
             drop_remainder=True, num_labels=len(label_list))
         estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
         tf.logging.info("***** Training completed*****")
+        # export SavedModel format for TF serving
+        export_dir_base = os.path.join(FLAGS.output_dir, 'saved_model')
+        estimator.export_saved_model(export_dir_base, serving_input_receiver_fn(FLAGS.max_seq_length, num_labels))
 
     if FLAGS.do_eval:
         eval_examples = processor.get_dev_examples(FLAGS.data_dir)
