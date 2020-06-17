@@ -33,6 +33,7 @@ import numpy as np
 from sklearn.metrics import f1_score
 from sklearn.utils.class_weight import compute_class_weight
 from collections import Counter
+
 flags = tf.flags
 
 FLAGS = flags.FLAGS
@@ -564,6 +565,7 @@ class DiscProcessor(DataProcessor):
                 InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
         return examples
 
+
 def get_examples_class_weight(examples, class_weight, classes):
     """
 
@@ -576,6 +578,7 @@ def get_examples_class_weight(examples, class_weight, classes):
     print("class_weight={}\nclasses={}\ny={}".format(class_weight, classes, y))
     return compute_class_weight(class_weight, np.unique(y), np.array(y))
 
+
 def convert_single_example(ex_index, example, label_list, max_seq_length,
                            tokenizer, class_weight):
     """Converts a single `InputExample` into a single `InputFeatures`."""
@@ -587,7 +590,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
             segment_ids=[0] * max_seq_length,
             label_id=0,
             is_real_example=False,
-            label_weights=[1.0]*len(class_weight),
+            label_weights=[1.0] * len(class_weight),
         )
     # 构建标签文本-索引id
     label_map = {}
@@ -776,6 +779,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
 
     return input_fn
 
+
 def serving_input_receiver_fn(seq_length, num_labels):
     """
     Serving input_fn that builds features from placeholders.
@@ -821,8 +825,16 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
 
 
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
-                 labels, num_labels, use_one_hot_embeddings, label_weights):
-    """Creates a classification model."""
+                 label_ids, num_labels, use_one_hot_embeddings, label_weights):
+    """
+    Creates a classification model.
+
+    Args:
+        label_ids: [batch_size=32, ]
+        num_labels: int, 类别个数
+        label_weights: [batch_size=32, class_size=2]
+
+    """
     model = modeling.BertModel(
         config=bert_config,
         is_training=is_training,
@@ -836,37 +848,44 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
     #
     # If you want to use the token-level output, use model.get_sequence_output()
     # instead.
+    # output_layer: [batch_size=32, hidden_size=768]
     output_layer = model.get_pooled_output()
 
+    # hidden_size: 768
     hidden_size = output_layer.shape[-1].value
 
-    # output_weights: [batch_size=32, embedding_size=768]
+    # output_weights: [num_labels=2, hidden_size=768]
     output_weights = tf.get_variable(
         "output_weights", [num_labels, hidden_size],
         initializer=tf.truncated_normal_initializer(stddev=0.02))
 
-    # output_bias: [batch_size, ]
+    # output_bias: [num_labels=2, ]
     output_bias = tf.get_variable(
         "output_bias", [num_labels], initializer=tf.zeros_initializer())
 
+    # 计算损失
     with tf.variable_scope("loss"):
         if is_training:
             # I.e., 0.1 dropout
             output_layer = tf.nn.dropout(output_layer, keep_prob=0.9)
 
+        # logits类别概率: [batch_size=32, class_size=2]
         logits = tf.matmul(output_layer, output_weights, transpose_b=True)
         logits = tf.nn.bias_add(logits, output_bias)
 
-        # logits: [batch_size=32, class_size=2]
-        # probabilities: [batch_size=32, class_size=2]
+        # 针对类别概率进行归一化处理probabilities: [batch_size=32, class_size=2], class_size=num_labels
         probabilities = tf.nn.softmax(logits, axis=-1)
-        # log_probs: [batch_size=32, class_size=2]
+
+        # 针对类别概率进行对数归一化处理log_probs: [batch_size=32, class_size=2]
         log_probs = tf.nn.log_softmax(logits, axis=-1)
-        # tf.logging.info("logits={}\nprobabilities={}\nlog_probs={}".format(logits, probabilities, log_probs))
-        # one_hot_labels: [batch_size, class_size=2], class_size=num_labels
-        one_hot_labels = tf.one_hot(labels, depth=num_labels, dtype=tf.float32)
-        # tf.logging.info("one_hot_labels={}\nlabel_weights={}".format(one_hot_labels, label_weights))
-        per_example_loss = -tf.reduce_sum((one_hot_labels * log_probs) * label_weights, axis=-1)
+
+        # one_hot_labels: [batch_size, class_size=2]
+        one_hot_labels = tf.one_hot(label_ids, depth=num_labels, dtype=tf.float32)
+
+        # 计算每个样本的NNL负对数似然损失(nagative log likelihood)
+        per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs * label_weights, axis=-1)
+
+        # 计算batch样本的平均损失
         loss = tf.reduce_mean(per_example_loss)
 
         return (loss, per_example_loss, logits, probabilities)
@@ -875,10 +894,32 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
 def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
                      use_one_hot_embeddings, fp16=FLAGS.use_fp16):
-    """Returns `model_fn` closure for TPUEstimator."""
+    """
+    Returns `model_fn` closure for TPUEstimator.
 
-    def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
-        """The `model_fn` for TPUEstimator."""
+    Args:
+        num_labels: int, 类别个数
+
+    """
+
+    def model_fn(features, labels, mode, params, config=None):  # pylint: disable=unused-argument
+        """
+        The `model_fn` for TPUEstimator.
+        模型有训练，验证和测试三种阶段，而且对于不同模式，对数据有不同的处理方式。例如在训练阶段，我们需要将数据喂给模型，
+        模型基于输入数据给出预测值，然后我们在通过预测值和真实值计算出loss，最后用loss更新网络参数，
+        而在评估阶段，我们则不需要反向传播更新网络参数，换句话说，mdoel_fn需要对三种模式设置三套代码。
+
+        Args:
+            features: dict of Tensor, This is batch_features from input_fn,`Tensor` or dict of `Tensor` (depends on data passed to `fit`
+            labels: This is batch_labels from input_fn. features, labels是从输入函数input_fn中返回的特征和标签batch
+            mode: An instance of tf.estimator.ModeKeys
+            params: Additional configuration for hyper-parameters. 是一个字典，它可以传入许多参数用来构建网络或者定义训练方式等
+
+
+        Return:
+            tf.estimator.EstimatorSpec
+
+        """
 
         tf.logging.info("*** Features ***")
         for name in sorted(features.keys()):
@@ -891,12 +932,16 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         label_weights = features["label_weights"]
         is_real_example = None
         if "is_real_example" in features:
+            # 类型强制转换为tf.float32
             is_real_example = tf.cast(features["is_real_example"], dtype=tf.float32)
         else:
+            # 创建一个将所有元素都设置为1的张量Tensor.
             is_real_example = tf.ones(tf.shape(label_ids), dtype=tf.float32)
 
+        # 根据mode判断是否为训练模式
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
+        # 基于特征数据创建模型，并计算loss等
         (total_loss, per_example_loss, logits, probabilities) = create_model(
             bert_config, is_training, input_ids, input_mask, segment_ids, label_ids,
             num_labels, use_one_hot_embeddings, label_weights)
@@ -926,6 +971,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                             init_string)
 
         output_spec = None
+        # 训练模式
         if mode == tf.estimator.ModeKeys.TRAIN:
             if FLAGS.num_gpu_cores > 1:
                 train_op = custom_optimization.create_optimizer(
@@ -945,8 +991,8 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                     loss=total_loss,
                     train_op=train_op,
                     scaffold_fn=scaffold_fn)
+        # 评估模式
         elif mode == tf.estimator.ModeKeys.EVAL:
-
             def metric_fn(per_example_loss, label_ids, logits, is_real_example):
                 predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
                 accuracy = tf.metrics.accuracy(
@@ -968,8 +1014,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                     "eval_f1": tf.contrib.metrics.f1_score(label_ids, predictions),
                 }
 
-            eval_metrics = (metric_fn,
-                            [per_example_loss, label_ids, logits, is_real_example])
+            eval_metrics = (metric_fn, [per_example_loss, label_ids, logits, is_real_example])
             if FLAGS.num_gpu_cores > 1:
                 output_spec = tf.estimator.EstimatorSpec(
                     mode=mode,
@@ -985,8 +1030,11 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                     eval_metrics=eval_metrics,
                     scaffold_fn=scaffold_fn)
         else:
+            # tf.estimator.ModeKeys.PREDICT 预测模式
+            # 基于logits计算最大的概率所在索引label
             predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
             if FLAGS.num_gpu_cores > 1:
+                # 多GPUs
                 output_spec = tf.estimator.EstimatorSpec(
                     mode=mode,
                     predictions={"probabilities": probabilities, "predictions": predictions})
