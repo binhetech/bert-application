@@ -499,6 +499,25 @@ class GarbledSentsProcessor(DataProcessor):
         classes = self.get_labels()
         return compute_class_weight(class_weight, np.array(classes), y)
 
+    def creat_example(self, text, label="0", set_type="test", i=0):
+        guid = "%s-%s" % (set_type, i)
+        if set_type == "test":
+            text_a = tokenization.convert_to_unicode(text)
+            label = "0"
+        else:
+            text_a = tokenization.convert_to_unicode(text)
+            label = tokenization.convert_to_unicode(label)
+        return InputExample(guid=guid, text_a=text_a, text_b=None, label=label)
+
+    def extract_features(self, sentences, max_seq_length, tokenizer, class_weight):
+        label_list = self.get_labels()
+        examples = []
+        for sent in sentences:
+            example = self.creat_example(sent)
+            examples.append(example)
+        features = convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, class_weight)
+        return features
+
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
@@ -780,7 +799,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
     return input_fn
 
 
-def serving_input_receiver_fn(seq_length, num_labels):
+def serving_input_receiver_fn():
     """
     Serving input_fn that builds features from placeholders.
 
@@ -788,22 +807,27 @@ def serving_input_receiver_fn(seq_length, num_labels):
     -------
     tf.estimator.export.ServingInputReceiver
     """
-    features = {
-        "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
-        "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
-        "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
-        "label_ids": tf.FixedLenFeature([], tf.int64),
-        "label_weights": tf.FixedLenFeature([num_labels], tf.float32),
-        "is_real_example": tf.FixedLenFeature([], tf.int64),
-    }
-    receiver_tensors = {
-        "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
-        "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
-        "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
-        "label_ids": tf.FixedLenFeature([], tf.int64),
-        "label_weights": tf.FixedLenFeature([num_labels], tf.float32),
-        "is_real_example": tf.FixedLenFeature([], tf.int64),
-    }
+    input_ids = tf.placeholder(dtype=tf.int64, shape=[None, None], name='input_ids')
+    input_mask = tf.placeholder(dtype=tf.int64, shape=[None, None], name='input_mask')
+    segment_ids = tf.placeholder(dtype=tf.int64, shape=[None, None], name='segment_ids')
+    label_ids = tf.placeholder(dtype=tf.int64, shape=[None, None], name='label_ids')
+    label_weights = tf.placeholder(dtype=tf.float32, shape=[None, None], name='label_weights')
+    is_real_example = tf.placeholder(dtype=tf.int64, shape=[None, None], name='is_real_example')
+
+    features = {'input_ids': input_ids,
+                'input_mask': input_mask,
+                'segment_ids': segment_ids,
+                "label_ids": label_ids,
+                "label_weights": label_weights,
+                "is_real_example": is_real_example,
+                }
+    receiver_tensors = {'input_ids': input_ids,
+                        'input_mask': input_mask,
+                        'segment_ids': segment_ids,
+                        "label_ids": label_ids,
+                        "label_weights": label_weights,
+                        "is_real_example": is_real_example,
+                        }
     return tf.estimator.export.ServingInputReceiver(features, receiver_tensors)
 
 
@@ -1105,20 +1129,27 @@ def input_fn_builder(features, seq_length, is_training, drop_remainder):
 # This function is not used by this file but is still used by the Colab and
 # people who depend on it.
 def convert_examples_to_features(examples, label_list, max_seq_length,
-                                 tokenizer):
+                                 tokenizer, class_weight):
     """Convert a set of `InputExample`s to a list of `InputFeatures`."""
 
-    features = []
-    class_weight = get_examples_class_weight(examples, "balanced", label_list)
+    feats = []
+    class_weight = get_examples_class_weight(examples, class_weight, label_list)
     for (ex_index, example) in enumerate(examples):
         if ex_index % 10000 == 0:
             tf.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
 
         feature = convert_single_example(ex_index, example, label_list,
                                          max_seq_length, tokenizer, class_weight)
-
-        features.append(feature)
-    return features
+        features = {
+            "input_ids": feature.input_ids,
+            "input_mask": feature.input_mask,
+            "segment_ids": feature.segment_ids,
+            "label_ids": [feature.label_id],
+            "label_weights": list(feature.label_weights),
+            "is_real_example": int(feature.is_real_example),
+        }
+        feats.append(features)
+    return feats
 
 
 def main(_):
@@ -1285,7 +1316,8 @@ def main(_):
         tf.logging.info("***** Training completed*****")
         # export SavedModel format for TF serving
         export_dir_base = os.path.join(FLAGS.output_dir, 'saved_model')
-        estimator.export_saved_model(export_dir_base, serving_input_receiver_fn(FLAGS.max_seq_length, num_labels))
+        estimator.export_saved_model(export_dir_base, serving_input_receiver_fn)
+        tf.logging.info("***** SavedModel export completed*****")
 
     if FLAGS.do_eval:
         eval_examples = processor.get_dev_examples(FLAGS.data_dir)
