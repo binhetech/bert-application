@@ -594,7 +594,7 @@ def get_examples_class_weight(examples, class_weight, classes):
     :return: list
     """
     y = [i.label for i in examples if i.label and not isinstance(i, PaddingInputExample)]
-    print("class_weight={}\nclasses={}\ny={}".format(class_weight, classes, y))
+    # print("class_weight={}\nclasses={}\ny={}".format(class_weight, classes, y))
     return compute_class_weight(class_weight, np.unique(y), np.array(y))
 
 

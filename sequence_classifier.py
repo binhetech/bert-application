@@ -1,7 +1,3 @@
-import sys
-
-sys.path.append("../")
-
 import json
 import requests
 import spacy
@@ -36,6 +32,15 @@ class BertSequenceClassifier(object):
         self.tokenizer = tokenization.FullTokenizer(vocab_file=vocab_file, do_lower_case=do_lower_case)
         self._url = url
 
+    def predict_sample(self, text):
+        features = self.processor.extract_features([text], self.max_seq_length, self.tokenizer, class_weight=None)
+        headers = {"content-type": "application/json"}
+        data = json.dumps({"signature_name": "serving_default", "instances": features})
+        postrslt = requests.post(self._url, data=data, headers=headers)
+        result = json.loads(postrslt.text)
+        result = [i["predictions"] for i in result["predictions"]]
+        return result[0]
+
     def predict(self, text):
         sentences = [i.text for i in SPACY_NLP(text).sents]
         features = self.processor.extract_features(sentences, self.max_seq_length, self.tokenizer, class_weight=None)
@@ -45,11 +50,3 @@ class BertSequenceClassifier(object):
         result = json.loads(postrslt.text)
         result = [i["predictions"] for i in result["predictions"]]
         return result
-
-
-if __name__ == "__main__":
-    cls = BertSequenceClassifier()
-    text = "Take one of my friends as an example, he works very hard to get a high mark in school to please his parents. " \
-           "But, his parents stopped to reward him with pocket money, he lost his interest in studying."
-    out = cls.predict(text)
-    print("labels={}".format(out))
