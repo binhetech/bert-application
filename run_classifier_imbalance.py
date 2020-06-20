@@ -64,6 +64,7 @@ flags.DEFINE_string(
     "init_checkpoint", None,
     "Initial checkpoint (usually from a pre-trained BERT model).")
 
+# 是否进行字符串转小写操作
 flags.DEFINE_bool(
     "do_lower_case", True,
     "Whether to lower case the input text. Should be True for uncased "
@@ -89,8 +90,14 @@ flags.DEFINE_integer("eval_batch_size", 8, "Total batch size for eval.")
 
 flags.DEFINE_integer("predict_batch_size", 8, "Total batch size for predict.")
 
+flags.DEFINE_string("train_file", "train.tsv", "train file name in data_dir.")
+flags.DEFINE_string("eval_file", "dev.tsv", "evaluate file name in data_dir.")
+flags.DEFINE_string("predict_file", "test.tsv", "test file name in data_dir.")
+
+# 初始学习率 for Adam 优化器
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
+# 总训练轮数
 flags.DEFINE_float("num_train_epochs", 3.0,
                    "Total number of training epochs to perform.")
 
@@ -103,6 +110,9 @@ flags.DEFINE_integer("save_checkpoints_steps", 1000,
                      "How often to save the model checkpoint.")
 
 flags.DEFINE_integer("iterations_per_loop", 1000,
+                     "How many steps to make in each estimator call.")
+
+flags.DEFINE_integer("max_steps_without_increase", 5000,
                      "How many steps to make in each estimator call.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
@@ -397,17 +407,17 @@ class SedProcessor(DataProcessor):
     def get_train_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+            self._read_tsv(os.path.join(data_dir, FLAGS.train_file)), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+            self._read_tsv(os.path.join(data_dir, FLAGS.eval_file)), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+            self._read_tsv(os.path.join(data_dir, FLAGS.predict_file)), "test")
 
     def get_labels(self):
         """See base class."""
@@ -437,17 +447,17 @@ class TopicRelProcessor(DataProcessor):
     def get_train_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+            self._read_tsv(os.path.join(data_dir, FLAGS.train_file)), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.tsv")), "dev")
+            self._read_tsv(os.path.join(data_dir, FLAGS.eval_file)), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+            self._read_tsv(os.path.join(data_dir, FLAGS.predict_file)), "test")
 
     def get_labels(self):
         """See base class."""
@@ -479,17 +489,17 @@ class GarbledSentsProcessor(DataProcessor):
     def get_train_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+            self._read_tsv(os.path.join(data_dir, FLAGS.train_file)), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+            self._read_tsv(os.path.join(data_dir, FLAGS.eval_file)), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+            self._read_tsv(os.path.join(data_dir, FLAGS.predict_file)), "test")
 
     def get_labels(self):
         """See base class."""
@@ -685,6 +695,8 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
     # 根据标签文本转换为标签索引id， 所以输入的都是标签列表的(get_labels()函数)索引id，最后预测argmax也是索引id
     label_id = label_map[example.label]
     label_weights = class_weight
+
+    # 打印日志
     if ex_index < 3:
         tf.logging.info("*** Example ***")
         tf.logging.info("guid: %s" % (example.guid))
@@ -695,6 +707,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
         tf.logging.info("label: %s (id = %d)" % (example.label, label_id))
         tf.logging.info("label_weights={}".format(label_weights))
 
+    # 转换成InputFeatures对象
     feature = InputFeatures(
         input_ids=input_ids,
         input_mask=input_mask,
@@ -745,7 +758,11 @@ def file_based_convert_examples_to_features(
 
 def file_based_input_fn_builder(input_file, seq_length, is_training,
                                 drop_remainder, num_labels):
-    """Creates an `input_fn` closure to be passed to TPUEstimator."""
+    """
+    Creates an `input_fn` closure to be passed to TPUEstimator.
+    基于文件的数据输入函数.
+
+    """
 
     # 特征列匹配
     name_to_features = {
@@ -777,7 +794,11 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
         return example
 
     def input_fn(params):
-        """The actual input function."""
+        """
+        The actual input function.
+        生成batch样本.
+
+        """
         batch_size = params["batch_size"]
 
         # For training, we want a lot of parallel reading and shuffling.
@@ -829,6 +850,27 @@ def serving_input_receiver_fn():
                         "is_real_example": is_real_example,
                         }
     return tf.estimator.export.ServingInputReceiver(features, receiver_tensors)
+
+
+def serving_input_fn():
+    """
+
+    :return:
+    """
+    input_ids = tf.placeholder(dtype=tf.int64, shape=[None, None], name='input_ids')
+    input_mask = tf.placeholder(dtype=tf.int64, shape=[None, None], name='input_mask')
+    segment_ids = tf.placeholder(dtype=tf.int64, shape=[None, None], name='segment_ids')
+    label_ids = tf.placeholder(dtype=tf.int64, shape=[None, None], name='label_ids')
+    label_weights = tf.placeholder(dtype=tf.float32, shape=[None, None], name='label_weights')
+    is_real_example = tf.placeholder(dtype=tf.int64, shape=[None, None], name='is_real_example')
+    input_fn = tf.estimator.export.build_raw_serving_input_receiver_fn({'input_ids': input_ids,
+                                                                        'input_mask': input_mask,
+                                                                        'segment_ids': segment_ids,
+                                                                        "label_ids": label_ids,
+                                                                        "label_weights": label_weights,
+                                                                        "is_real_example": is_real_example,
+                                                                        })()
+    return input_fn
 
 
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
@@ -1055,7 +1097,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                     scaffold_fn=scaffold_fn)
         else:
             # tf.estimator.ModeKeys.PREDICT 预测模式
-            # 基于logits计算最大的概率所在索引label
+            # 基于logits计算最大的概率所在索引的label
             predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
             if FLAGS.num_gpu_cores > 1:
                 # 多GPUs
@@ -1299,27 +1341,86 @@ def main(_):
             eval_batch_size=FLAGS.eval_batch_size,
             predict_batch_size=FLAGS.predict_batch_size)
 
-    if FLAGS.do_train:
+    if FLAGS.do_train and FLAGS.do_eval:
+        '''
+        pipeline: train examples -> (write tf_record) -> (read tf_record) -> train 
+        '''
+        # ------------- 1.Train ------------- #
+        # 1.1 将文本预处理，并存储为tf.record格式文件
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
-        file_based_convert_examples_to_features(
-            train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file, True, FLAGS.class_weight)
+        file_based_convert_examples_to_features(train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file,
+                                                True, FLAGS.class_weight)
         tf.logging.info("***** Running training *****")
         tf.logging.info("  Num examples = %d", len(train_examples))
         tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
         tf.logging.info("  Num steps = %d", num_train_steps)
+        # 1.2 基于tf.record格式文件进行迭代batch处理样本
         train_input_fn = file_based_input_fn_builder(
             input_file=train_file,
             seq_length=FLAGS.max_seq_length,
             is_training=True,
             drop_remainder=True, num_labels=len(label_list))
-        estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
-        tf.logging.info("***** Training completed*****")
+        # ------------- 2.Eval ------------- #
+        eval_examples = processor.get_dev_examples(FLAGS.data_dir)
+        num_actual_eval_examples = len(eval_examples)
+        if FLAGS.use_tpu:
+            # TPU requires a fixed batch size for all batches, therefore the number
+            # of examples must be a multiple of the batch size, or else examples
+            # will get dropped. So we pad with fake examples which are ignored
+            # later on. These do NOT count towards the metric (all tf.metrics
+            # support a per-instance weight, and these get a weight of 0.0).
+            while len(eval_examples) % FLAGS.eval_batch_size != 0:
+                eval_examples.append(PaddingInputExample())
+
+        eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
+        file_based_convert_examples_to_features(
+            eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file, False, FLAGS.class_weight)
+
+        tf.logging.info("***** Running evaluation *****")
+        tf.logging.info("  Num examples = %d (%d actual, %d padding)",
+                        len(eval_examples), num_actual_eval_examples,
+                        len(eval_examples) - num_actual_eval_examples)
+        tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+
+        # This tells the estimator to run through the entire set.
+        eval_steps = None
+        # However, if running eval on the TPU, you will need to specify the
+        # number of steps.
+        if FLAGS.use_tpu:
+            assert len(eval_examples) % FLAGS.eval_batch_size == 0
+            eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
+
+        eval_drop_remainder = True if FLAGS.use_tpu else False
+        eval_input_fn = file_based_input_fn_builder(
+            input_file=eval_file,
+            seq_length=FLAGS.max_seq_length,
+            is_training=False,
+            drop_remainder=eval_drop_remainder, num_labels=len(label_list))
+
+        # 1.3 early stopping
+        early_stopping_hook = tf.estimator.experimental.stop_if_no_increase_hook(
+            estimator=estimator,
+            metric_name='eval_f1',
+            max_steps_without_increase=FLAGS.max_steps_without_increase,
+            eval_dir=None,
+            min_steps=200,
+            run_every_secs=None,
+            run_every_steps=FLAGS.save_checkpoints_steps)
+        train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps,
+                                            hooks=[early_stopping_hook])
+        eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps, throttle_secs=0)
+
+        # estimator.train(input_fn=train_input_fn, max_steps=num_train_steps, hooks=[early_stopping_hook])
+        tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+
+        tf.logging.info("***** Training & Evaluating completed*****")
+
         # export SavedModel format for TF serving
         export_dir_base = os.path.join(FLAGS.output_dir, 'saved_model')
         estimator.export_saved_model(export_dir_base, serving_input_receiver_fn)
         tf.logging.info("***** SavedModel export completed*****")
 
-    if FLAGS.do_eval:
+    elif FLAGS.do_eval:
         eval_examples = processor.get_dev_examples(FLAGS.data_dir)
         num_actual_eval_examples = len(eval_examples)
         if FLAGS.use_tpu:
