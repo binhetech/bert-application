@@ -70,6 +70,8 @@ flags.DEFINE_bool(
     "Whether to lower case the input text. Should be True for uncased "
     "models and False for cased models.")
 
+flags.DEFINE_bool("do_early_stopping", True, "Whether to do early stopping")
+
 flags.DEFINE_integer(
     "max_seq_length", 128,
     "The maximum total input sequence length after WordPiece tokenization. "
@@ -1391,23 +1393,25 @@ def main(_):
             is_training=False,
             drop_remainder=eval_drop_remainder, num_labels=len(label_list))
 
-        # 1.3 early stopping
-        early_stopping_hook = tf.estimator.experimental.stop_if_no_increase_hook(
-            estimator=estimator,
-            metric_name='eval_f1',
-            max_steps_without_increase=FLAGS.max_steps_without_increase,
-            eval_dir=None,
-            min_steps=200,
-            run_every_secs=None,
-            run_every_steps=FLAGS.save_checkpoints_steps)
-        train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps,
-                                            hooks=[early_stopping_hook])
-        eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps, throttle_secs=0)
+        if FLAGS.do_early_stopping:
+            # 1.3 early stopping
+            early_stopping_hook = tf.estimator.experimental.stop_if_no_increase_hook(
+                estimator=estimator,
+                metric_name='eval_f1',
+                max_steps_without_increase=FLAGS.max_steps_without_increase,
+                eval_dir=None,
+                min_steps=200,
+                run_every_secs=None,
+                run_every_steps=FLAGS.save_checkpoints_steps)
+            train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps,
+                                                hooks=[early_stopping_hook])
+            eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps, throttle_secs=0)
 
-        # estimator.train(input_fn=train_input_fn, max_steps=num_train_steps, hooks=[early_stopping_hook])
-        tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
-
-        tf.logging.info("***** Training & Evaluating completed*****")
+            tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+            tf.logging.info("***** Training & Evaluating completed*****")
+        else:
+            estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
+            tf.logging.info("***** Training completed*****")
 
         # export SavedModel format for TF serving
         export_dir_base = os.path.join(FLAGS.output_dir, 'saved_model')
