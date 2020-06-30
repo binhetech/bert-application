@@ -111,9 +111,11 @@ flags.DEFINE_integer("iterations_per_loop", 1000,
 flags.DEFINE_integer("max_steps_without_increase", 5000,
                      "How many steps to make in each estimator call.")
 
+flags.DEFINE_integer("min_steps", 1000, "The minimum steps for early stopping")
+
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
-flags.DEFINE_string("class_weight", "balanced", "Whether to use class weight(balanced or None).")
+flags.DEFINE_string("class_weight", None, "Whether to use class weight(balanced or None).")
 
 tf.flags.DEFINE_string(
     "tpu_name", None,
@@ -571,7 +573,7 @@ class DiscProcessor(DataProcessor):
 
     def get_labels(self):
         """See base class."""
-        return ["0.0", "1.0", "2.0", "3.0", "4.0", "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0", "12.0"]
+        return [str(i) for i in range(13)]
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
@@ -579,6 +581,8 @@ class DiscProcessor(DataProcessor):
         for (i, line) in enumerate(lines):
             if i == 0:
                 continue
+            if i <= 3:
+                print("i={}, line={}".format(i, line))
             guid = "%s-%s" % (set_type, i)
             if set_type == "test":
                 text_a = tokenization.convert_to_unicode(line[1])
@@ -1400,7 +1404,7 @@ def main(_):
                 metric_name='eval_f1',
                 max_steps_without_increase=FLAGS.max_steps_without_increase,
                 eval_dir=None,
-                min_steps=200,
+                min_steps=FLAGS.min_steps,
                 run_every_secs=None,
                 run_every_steps=FLAGS.save_checkpoints_steps)
             train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps,

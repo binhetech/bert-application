@@ -41,12 +41,20 @@ class BertSequenceClassifier(object):
         result = [i["predictions"] for i in result["predictions"]]
         return result[0]
 
+    def predict_sentence(self, sentences):
+        try:
+            features = self.processor.extract_features(sentences, self.max_seq_length, self.tokenizer,
+                                                       class_weight=None)
+            headers = {"content-type": "application/json"}
+            data = json.dumps({"signature_name": "serving_default", "instances": features})
+            postrslt = requests.post(self._url, data=data, headers=headers)
+            result = json.loads(postrslt.text)
+            result = [i["predictions"] for i in result["predictions"]]
+        except Exception:
+            result = [0] * len(sentences)
+        return result
+
     def predict(self, text):
         sentences = [i.text for i in SPACY_NLP(text).sents]
-        features = self.processor.extract_features(sentences, self.max_seq_length, self.tokenizer, class_weight=None)
-        headers = {"content-type": "application/json"}
-        data = json.dumps({"signature_name": "serving_default", "instances": features})
-        postrslt = requests.post(self._url, data=data, headers=headers)
-        result = json.loads(postrslt.text)
-        result = [i["predictions"] for i in result["predictions"]]
+        result = self.predict_sentence(sentences)
         return result
