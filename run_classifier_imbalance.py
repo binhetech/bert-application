@@ -20,19 +20,16 @@ from __future__ import print_function
 
 import collections
 import csv
-import os
 import modeling
 import optimization
 import custom_optimization
 import tokenization
 import tensorflow as tf
 from tensorflow.contrib.distribute import AllReduceCrossDeviceOps
-from tensorflow.python.client import device_lib
 from tensorflow.contrib import *
 import numpy as np
-from sklearn.metrics import f1_score
+import tf_metrics
 from sklearn.utils.class_weight import compute_class_weight
-from collections import Counter
 
 flags = tf.flags
 
@@ -89,6 +86,8 @@ flags.DEFINE_integer("predict_batch_size", 8, "Total batch size for predict.")
 flags.DEFINE_string("train_file", "train.tsv", "train file name in data_dir.")
 flags.DEFINE_string("eval_file", "dev.tsv", "evaluate file name in data_dir.")
 flags.DEFINE_string("predict_file", "test.tsv", "test file name in data_dir.")
+
+flags.DEFINE_string("classifier_mode", "binary", "binary or multi-class for classifier.")
 
 # 初始学习率 for Adam 优化器
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
@@ -190,7 +189,9 @@ class InputFeatures(object):
                  segment_ids,
                  label_id,
                  is_real_example=True,
-                 label_weights=[1.0]):
+                 label_weights=None):
+        if label_weights is None:
+            label_weights = [1.0]
         self.input_ids = input_ids
         self.input_mask = input_mask
         self.segment_ids = segment_ids
@@ -324,17 +325,17 @@ class MrpcProcessor(DataProcessor):
     def get_train_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+            self._read_tsv(os.path.join(data_dir, FLAGS.train_file)), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+            self._read_tsv(os.path.join(data_dir, FLAGS.eval_file)), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+            self._read_tsv(os.path.join(data_dir, FLAGS.predict_file)), "test")
 
     def get_labels(self):
         """See base class."""
@@ -364,17 +365,17 @@ class ColaProcessor(DataProcessor):
     def get_train_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+            self._read_tsv(os.path.join(data_dir, FLAGS.train_file)), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+            self._read_tsv(os.path.join(data_dir, FLAGS.eval_file)), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+            self._read_tsv(os.path.join(data_dir, FLAGS.predict_file)), "test")
 
     def get_labels(self):
         """See base class."""
@@ -559,17 +560,17 @@ class DiscProcessor(DataProcessor):
     def get_train_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+            self._read_tsv(os.path.join(data_dir, FLAGS.train_file)), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+            self._read_tsv(os.path.join(data_dir, FLAGS.eval_file)), "dev")
 
     def get_test_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+            self._read_tsv(os.path.join(data_dir, FLAGS.predict_file)), "test")
 
     def get_labels(self):
         """See base class."""
@@ -1065,19 +1066,26 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                     labels=label_ids, predictions=predictions, weights=is_real_example)
                 loss = tf.metrics.mean(values=per_example_loss, weights=is_real_example)
                 # add more metrics
-                pr, pr_op = tf.metrics.precision(
-                    labels=label_ids, predictions=predictions, weights=is_real_example)
-                re, re_op = tf.metrics.recall(
-                    labels=label_ids, predictions=predictions, weights=is_real_example)
-                # f1, f1_op = (2 * pr * re) / (pr + re)  # f1-score for binary classification
-                # print("label_ids={}, predictions={}".format(label_ids, predictions))
-                # print("label_ids={}, predictions={}".format(label_ids, predictions.cpu()))
+                pr, pr_op = tf.metrics.precision(labels=label_ids, predictions=predictions, weights=is_real_example)
+                re, re_op = tf.metrics.recall(labels=label_ids, predictions=predictions, weights=is_real_example)
+                if FLAGS.classifier_mode == "multi-class":
+                    # multi-class
+                    # pr, pr_op = tf_metrics.precision(label_ids, predictions, num_labels, average="macro")
+                    # re, re_op = tf_metrics.recall(label_ids, predictions, num_labels, average="macro")
+                    f1 = tf_metrics.f1(label_ids, predictions, num_labels, average="macro")
+                else:
+                    # binary classifier
+                    f1 = tf.contrib.metrics.f1_score(label_ids, predictions)
+                    # f1, f1_op = (2 * pr * re) / (pr + re)  # f1-score for binary classification
+                    # print("label_ids={}, predictions={}".format(label_ids, predictions))
+                    # print("label_ids={}, predictions={}".format(label_ids, predictions.cpu()))
+                # 返回结果：dict: {key: value(tuple: (metric_tensor, update_op)) }
                 return {
                     "eval_accuracy": accuracy,
                     "eval_loss": loss,
                     "eval_precision": (pr, pr_op),
                     "eval_recall": (re, re_op),
-                    "eval_f1": tf.contrib.metrics.f1_score(label_ids, predictions),
+                    "eval_f1": f1,
                 }
 
             eval_metrics = (metric_fn, [per_example_loss, label_ids, logits, is_real_example])
@@ -1253,7 +1261,7 @@ def main(_):
 
     model_fn = model_fn_builder(
         bert_config=bert_config,
-        num_labels=len(label_list),
+        num_labels=num_labels,
         init_checkpoint=FLAGS.init_checkpoint,
         learning_rate=FLAGS.learning_rate,
         num_train_steps=num_train_steps,

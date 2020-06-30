@@ -5,11 +5,15 @@ export DATA_DIR=../glue
 
 nohup python3 ../run_classifier_imbalance.py \
   --task_name=DISC \
-  --do_train=true \
-  --do_eval=true \
+  --do_train=True \
+  --do_eval=True \
   --do_predict=True \
-  --max_steps_without_increase 10000 \
-  --min_steps 1000 \
+  --train_file=test.tsv \
+  --eval_file=dev.tsv \
+  --predict_file=test.tsv \
+  --classifier_mode=multi-class \
+  --max_steps_without_increase=10000 \
+  --min_steps=200 \
   --do_early_stopping=True \
   --class_weight=None \
   --data_dir=$DATA_DIR/DISC \
@@ -24,7 +28,7 @@ nohup python3 ../run_classifier_imbalance.py \
   --num_train_epochs=5 \
   --num_gpu_cores=2 \
   --do_lower_case=False \
-  --output_dir=../fine_tuned/disc |
-  tee disc.log
+  --output_dir=../fine_tuned/disc-1 |
+  tee disc-1.log
 
 tail -f disc.log
