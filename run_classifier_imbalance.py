@@ -18,18 +18,22 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
 import collections
 import csv
-import modeling
-import optimization
-import custom_optimization
-import tokenization
-import tensorflow as tf
-from tensorflow.contrib.distribute import AllReduceCrossDeviceOps
-from tensorflow.contrib import *
+import pandas as pd
+from sklearn.metrics import classification_report
 import numpy as np
+import tensorflow as tf
 import tf_metrics
 from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.contrib import *
+from tensorflow.contrib.distribute import AllReduceCrossDeviceOps
+
+import custom_optimization
+import modeling
+import optimization
+import tokenization
 
 flags = tf.flags
 
@@ -107,10 +111,12 @@ flags.DEFINE_integer("save_checkpoints_steps", 1000,
 flags.DEFINE_integer("iterations_per_loop", 1000,
                      "How many steps to make in each estimator call.")
 
+# early stopping parameters
+flags.DEFINE_integer("min_steps", 1000, "The minimum steps for early stopping")
 flags.DEFINE_integer("max_steps_without_increase", 5000,
                      "How many steps to make in each estimator call.")
-
-flags.DEFINE_integer("min_steps", 1000, "The minimum steps for early stopping")
+flags.DEFINE_integer("max_steps_without_decrease", 5000,
+                     "How many steps to make in each estimator call.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
@@ -897,9 +903,15 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
     Creates a classification model.
 
     Args:
+        bert_config:
+        is_training:
+        input_ids:
+        input_mask:
+        segment_ids:
         label_ids: [batch_size=32, ]
         num_labels: int, 类别个数
-        label_weights: [batch_size=32, class_size=2]
+        use_one_hot_embeddings:
+        label_weights: [batch_size=32, num_labels=2]
 
     """
     model = modeling.BertModel(
@@ -934,9 +946,14 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
     with tf.variable_scope("loss"):
         if is_training:
             # I.e., 0.1 dropout
+            # 在训练阶段，为了防止过拟合，在全连接层随机扔掉一部分神经元。也就是让某个神经元的激活值以一定的概率p让其停止工作，
+            # 在这次训练过程中不更新权值，也不参加神经网络的计算。 但是它的权重得保留下来（只是暂时不更新而已），因为下次样本输入时它可能又得工作了
+            # dropout作用：使输入tensor中某些元素变为0，其它没变0的元素值乘以1/keep_prob
+            # train的时候才是dropout起作用的时候，eval/test的时候不应该让dropout起作用
             output_layer = tf.nn.dropout(output_layer, keep_prob=0.9)
 
-        # logits类别概率: [batch_size=32, class_size=2]
+        # logits类别概率: [batch_size=32, num_labels=2]
+        # 矩阵相乘 a*b, 其中b在进行乘法计算前进行转置
         logits = tf.matmul(output_layer, output_weights, transpose_b=True)
         logits = tf.nn.bias_add(logits, output_bias)
 
@@ -1068,24 +1085,22 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                 # add more metrics
                 pr, pr_op = tf.metrics.precision(labels=label_ids, predictions=predictions, weights=is_real_example)
                 re, re_op = tf.metrics.recall(labels=label_ids, predictions=predictions, weights=is_real_example)
-                if FLAGS.classifier_mode == "multi-class":
-                    # multi-class
-                    # pr, pr_op = tf_metrics.precision(label_ids, predictions, num_labels, average="macro")
-                    # re, re_op = tf_metrics.recall(label_ids, predictions, num_labels, average="macro")
-                    f1 = tf_metrics.f1(label_ids, predictions, num_labels, average="macro")
-                else:
-                    # binary classifier
-                    f1 = tf.contrib.metrics.f1_score(label_ids, predictions)
-                    # f1, f1_op = (2 * pr * re) / (pr + re)  # f1-score for binary classification
-                    # print("label_ids={}, predictions={}".format(label_ids, predictions))
-                    # print("label_ids={}, predictions={}".format(label_ids, predictions.cpu()))
+                # if FLAGS.classifier_mode == "multi-class":
+                #     # multi-class
+                #     # pr, pr_op = tf_metrics.precision(label_ids, predictions, num_labels, average="macro")
+                #     # re, re_op = tf_metrics.recall(label_ids, predictions, num_labels, average="macro")
+                #     f1 = tf_metrics.f1(label_ids, predictions, num_labels, average="macro")
+                # else:
+                #     # binary classifier
+                #     f1 = tf.contrib.metrics.f1_score(label_ids, predictions)
+                #     # f1, f1_op = (2 * pr * re) / (pr + re)  # f1-score for binary classification
                 # 返回结果：dict: {key: value(tuple: (metric_tensor, update_op)) }
                 return {
                     "eval_accuracy": accuracy,
                     "eval_loss": loss,
                     "eval_precision": (pr, pr_op),
                     "eval_recall": (re, re_op),
-                    "eval_f1": f1,
+                    # "eval_f1": f1,
                 }
 
             eval_metrics = (metric_fn, [per_example_loss, label_ids, logits, is_real_example])
@@ -1200,6 +1215,20 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
         }
         feats.append(features)
     return feats
+
+
+def print_cls_report(fileTest=os.path.join(FLAGS.data_dir, FLAGS.train_file),
+                     fileResult=os.path.join(FLAGS.output_dir, "test_results.tsv"),
+                     sep="\t",
+                     header="label"):
+    try:
+        y_true = pd.read_csv(fileTest, sep=sep)[header]
+        y_pred = [float(i.strip()) for i in open(fileResult, "r").readlines()]
+        rp = classification_report(y_true, y_pred, digits=4)
+        print("report:\n{}".format(rp))
+    except Exception as e:
+        print("Error: {}".format(repr(e)))
+    return
 
 
 def main(_):
@@ -1407,10 +1436,10 @@ def main(_):
 
         if FLAGS.do_early_stopping:
             # 1.3 early stopping
-            early_stopping_hook = tf.estimator.experimental.stop_if_no_increase_hook(
+            early_stopping_hook = tf.estimator.experimental.stop_if_no_decrease_hook(
                 estimator=estimator,
-                metric_name='eval_f1',
-                max_steps_without_increase=FLAGS.max_steps_without_increase,
+                metric_name='eval_loss',
+                max_steps_without_decrease=FLAGS.max_steps_without_decrease,
                 eval_dir=None,
                 min_steps=FLAGS.min_steps,
                 run_every_secs=None,
@@ -1527,6 +1556,11 @@ def main(_):
                 num_written_lines += 1
         assert num_written_lines == num_actual_predict_examples
         tf.logging.info("***** Prediction completed*****")
+        # 打印输出分类任务的性能指标
+        print_cls_report(fileTest=os.path.join(FLAGS.data_dir, FLAGS.predict_file),
+                         fileResult=os.path.join(FLAGS.output_dir, "test_results.tsv"),
+                         sep="\t",
+                         header="label")
 
 
 if __name__ == "__main__":
