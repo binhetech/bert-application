@@ -18,10 +18,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import sys
-
-sys.path.append("../")
-
 import os
 import collections
 import csv
@@ -31,31 +27,26 @@ import numpy as np
 import tensorflow as tf
 import tf_metrics
 from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.contrib import *
-from tensorflow.contrib.distribute import AllReduceCrossDeviceOps
+# from tensorflow.contrib import *
+# from tensorflow.contrib.distribute import AllReduceCrossDeviceOps
 from tensorflow.python import keras
-from tensorflow.contrib.layers.python.layers import initializers
-
+from tensorflow import initializers
 import torch
-
-from bilstm_crf import BiLSTM_CRF
-
-from transformers import TFBertModel
-from transformers import BertTokenizer
-
-model = TFBertModel.from_pretrained('bert-base-cased')
-tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
-
-L = keras.layers
-
 import custom_optimization
 import modeling
 import optimization
 import tokenization
+from transformers import TFBertModel, TFBertMainLayer, BertConfig
+from transformers import BertTokenizer
+from bilstm_crf import BiLSTM_CRF
 
-flags = tf.flags
+tf.compat.v1.disable_eager_execution()
 
+flags = tf.compat.v1.flags
 FLAGS = flags.FLAGS
+L = keras.layers
+# model = TFBertModel.from_pretrained('bert-base-cased')
+tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
 
 ## Required parameters
 flags.DEFINE_string(
@@ -144,25 +135,25 @@ flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
 flags.DEFINE_string("class_weight", None, "Whether to use class weight(balanced or None).")
 
-tf.flags.DEFINE_string(
+flags.DEFINE_string(
     "tpu_name", None,
     "The Cloud TPU to use for training. This should be either the name "
     "used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 "
     "url.")
 
-tf.flags.DEFINE_string(
+flags.DEFINE_string(
     "tpu_zone", None,
     "[Optional] GCE zone where the Cloud TPU is located in. If not "
     "specified, we will attempt to automatically detect the GCE project from "
     "metadata.")
 
-tf.flags.DEFINE_string(
+flags.DEFINE_string(
     "gcp_project", None,
     "[Optional] Project name for the Cloud TPU-enabled project. If not "
     "specified, we will attempt to automatically detect the GCE project from "
     "metadata.")
 
-tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
+flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
 
 flags.DEFINE_integer(
     "num_tpu_cores", 8,
@@ -211,9 +202,21 @@ class InputFeatures(object):
     def __init__(self,
                  input_ids,
                  label_ids,
+                 sequence_lengths,
                  is_real_example=True):
+        """
+        样本的输入特征数据初始化方法.
+
+        Args:
+            input_ids: list of list, [max_seq_length, max_token_length]
+            label_ids: list of int, [max_seq_length, ]
+            sequence_lengths: list of int, [max_seq_length, ], 值为每个序列的真实长度。若大于0，则为真实序列，否则为padding的序列
+            is_real_example: boolean, 是否为真实样本， (否：padding的虚拟样本)
+
+        """
         self.input_ids = input_ids
         self.label_ids = label_ids
+        self.sequence_lengths = sequence_lengths
         self.is_real_example = is_real_example
 
 
@@ -239,12 +242,10 @@ class DataProcessor(object):
     @classmethod
     def _read_tsv(cls, input_file, quotechar='"'):
         """Reads a tab separated value file."""
-        with tf.gfile.Open(input_file, "r") as f:
+        with tf.io.gfile.GFile(input_file, "r") as f:
             reader = csv.reader(f, delimiter="\t", quotechar=quotechar)
             lines = []
             for line in reader:
-                if len(lines) > 1000:
-                    break
                 lines.append(line)
             return lines
 
@@ -279,10 +280,18 @@ class DiscProcessor(DataProcessor):
                   'S_C0': 29, 'S_C1': 30, 'S_C2': 31, 'S_I0': 32, 'S_M0': 33, 'S_M1': 34, 'S_M2': 35,
                   'S_S0': 36,
                   'S_S1': 37, 'S_S2': 38, 'S_T0': 39, 'S_T1': 40}
-        # O(other) 标签放在索引0位置上
+        # 将O(other) 标签放在索引0位置上
         label_list = ['O'] + [str(i) for i in tag2id.keys()]
-        print("{} label_list={}".format(len(label_list), label_list))
+        # print("{} label_list={}".format(len(label_list), label_list))
         return label_list
+
+    def get_label_map(self):
+        # 构建标签文本-索引id
+        label_map = {}
+        for (i, label) in enumerate(self.get_labels()):
+            label_map[label] = i
+        print("{} label_map={}".format(len(label_map), label_map))
+        return label_map
 
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
@@ -292,7 +301,7 @@ class DiscProcessor(DataProcessor):
         for (i, line) in enumerate(lines):
             if i <= 3:
                 print("i={}, line={}".format(i, line))
-            if len(examples) > 10:
+            if len(examples) >= 100:
                 print("i={}, examples[-1].texts={}".format(i, examples[-1].texts))
                 break
             if len(line) < 2:
@@ -304,7 +313,7 @@ class DiscProcessor(DataProcessor):
             else:
                 if set_type == "test":
                     text = tokenization.convert_to_unicode(line[0])
-                    label = "0"
+                    label = "O"  # "other" label
                 else:
                     text = tokenization.convert_to_unicode(line[0])
                     label = tokenization.convert_to_unicode(line[1])
@@ -313,14 +322,14 @@ class DiscProcessor(DataProcessor):
         return examples
 
 
-def convert_single_example(ex_index, example, label_list, max_seq_length, max_token_length, tokenizer):
+def convert_single_example(ex_index, example, label_map, max_seq_length, max_token_length, tokenizer):
     """
     Converts a single `InputExample` into a single `InputFeatures`.
 
     Args:
         ex_index: int, example index
         example: SequenceExample
-        label_list: list
+        label_map: dict, label2id, 全部标签类列表2id
         max_seq_length: int, 最大序列长度，即句子个数， 默认64
         max_token_length: int, 最大句子中单词token长度，一般为128
         tokenizer: 分词器
@@ -331,24 +340,18 @@ def convert_single_example(ex_index, example, label_list, max_seq_length, max_to
         return InputFeatures(
             input_ids=[[tokenizer.pad_token_id] * max_token_length] * max_seq_length,
             label_ids=[0] * max_seq_length,
+            sequence_lengths=[0] * max_seq_length,
             is_real_example=False,
         )
 
-    # 构建标签文本-索引id
-    label_map = {}
-    for (i, label) in enumerate(label_list):
-        label_map[label] = i
-    # 打印label_map
-    if ex_index == 0:
-        tf.logging.info("{} label_map={}".format(len(label_map), label_map))
+    input_ids = [tokenizer.encode(tokens, max_length=max_token_length, pad_to_max_length=True, truncation=True) for
+                 tokens in example.texts[:max_seq_length]]
 
-    input_ids = tf.constant([tokenizer.encode(tokens, max_length=max_token_length, pad_to_max_length=True) for
-                             tokens in example.texts[:max_seq_length]])
-
-    if input_ids.shape[0] < max_seq_length:
-        padding_input_ids = tf.constant(tokenizer.pad_token_id,
-                                        shape=[max_seq_length - input_ids.shape[0], max_token_length])
-        input_ids = tf.concat([input_ids, padding_input_ids], axis=0)
+    sequence_lengths = [len(i) for i in input_ids]
+    if len(input_ids) < max_seq_length:
+        padding_input_ids = [[tokenizer.pad_token_id] * max_token_length] * (max_seq_length - len(input_ids))
+        input_ids += padding_input_ids
+        sequence_lengths += [0] * len(padding_input_ids)
 
     label_ids = [label_map[i] for i in example.labels]
     if len(label_ids) > max_seq_length:
@@ -356,26 +359,28 @@ def convert_single_example(ex_index, example, label_list, max_seq_length, max_to
     else:
         label_ids += [0] * (max_seq_length - len(label_ids))
 
-    assert input_ids.shape[0] == max_seq_length
-    assert input_ids.shape[1] == max_token_length
+    assert len(input_ids) == max_seq_length
     assert len(label_ids) == max_seq_length
+    assert len(sequence_lengths) == max_seq_length
 
     if ex_index < 3:
-        tf.logging.info("*** Example ***")
-        tf.logging.info("guid: {}".format(example.guid))
-        tf.logging.info("{} input_ids: {}".format(input_ids.shape, input_ids))
-        tf.logging.info("{} labels_ids: {}".format(len(label_ids), label_ids))
+        tf.compat.v1.logging.info("*** Example ***")
+        tf.compat.v1.logging.info("guid: {}".format(example.guid))
+        tf.compat.v1.logging.info("{} input_ids: {}".format(np.array(input_ids).shape, input_ids))
+        tf.compat.v1.logging.info("{} labels_ids: {}".format(len(label_ids), label_ids))
+        tf.compat.v1.logging.info("{} sequence_lengths: {}".format(len(sequence_lengths), sequence_lengths))
 
     # 转换成InputFeatures对象
     feature = InputFeatures(
         input_ids=input_ids,
         label_ids=label_ids,
+        sequence_lengths=sequence_lengths,
         is_real_example=True,
     )
     return feature
 
 
-def file_based_convert_examples_to_features(examples, label_list, max_seq_length, max_token_length, tokenizer,
+def file_based_convert_examples_to_features(examples, label_map, max_seq_length, max_token_length, tokenizer,
                                             output_file):
     """
     Convert a set of `InputExample`s to a TFRecord file.
@@ -386,33 +391,40 @@ def file_based_convert_examples_to_features(examples, label_list, max_seq_length
 
     Args:
         examples: list, 样本s
-        label_list: list of label, 全部标签类列表
+        label_map: dict, label2id, 全部标签类列表2id
         max_seq_length: 最大序列长度
         tokenizer: tokenizer
         output_file: string, TF records输出文件
 
     """
 
-    writer = tf.python_io.TFRecordWriter(output_file)
+    writer = tf.io.TFRecordWriter(output_file)
     for (ex_index, example) in enumerate(examples):
         if ex_index % 10000 == 0:
-            tf.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
+            tf.compat.v1.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
 
-        feature = convert_single_example(ex_index, example, label_list, max_seq_length, max_token_length, tokenizer)
+        feature = convert_single_example(ex_index, example, label_map, max_seq_length, max_token_length, tokenizer)
 
         # Context features for the entire sequence
+        # # 算序列真实长度
+        # print("{} feature.input_ids={}".format(np.array(feature.input_ids).shape, feature.input_ids))
+        # used = tf.sign(tf.abs(feature.sequence_lengths))
+        # sequence_lengths = np.sum(used)
+        # print("sequence_lengths={}".format(sequence_lengths))
         context = tf.train.Features(
             feature={
+                "sequence_lengths": tf.train.Feature(int64_list=tf.train.Int64List(value=feature.sequence_lengths)),
                 "label_ids": tf.train.Feature(int64_list=tf.train.Int64List(value=feature.label_ids)),
                 "is_real_example": tf.train.Feature(
                     int64_list=tf.train.Int64List(value=[feature.is_real_example]))})
 
         # Feature lists for the sequential features of the example
-        with tf.Session():
-            # print("context={}".format(context))
-            feat_dict = {"input_ids": tf.train.FeatureList(
-                feature=[tf.train.Feature(int64_list=tf.train.Int64List(value=i)) for i in feature.input_ids.eval()])}
-            # print("feat_dict={}".format(feat_dict))
+        # with tf.compat.v1.Session():
+        # print("context={}".format(context))
+        feat_dict = {"input_ids": tf.train.FeatureList(
+            feature=[tf.train.Feature(int64_list=tf.train.Int64List(value=i)) for i in feature.input_ids])}
+
+        # print("feat_dict={}".format(feat_dict))
         feature_lists = tf.train.FeatureLists(feature_list=feat_dict)
 
         tf_example = tf.train.SequenceExample(context=context, feature_lists=feature_lists)
@@ -431,13 +443,14 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
 
     # 上下文特征列匹配
     context_features = {
-        "label_ids": tf.FixedLenFeature([seq_length], tf.int64),
-        "is_real_example": tf.FixedLenFeature([], tf.int64),
+        "sequence_lengths": tf.io.FixedLenFeature([seq_length], tf.int64),
+        "label_ids": tf.io.FixedLenFeature([seq_length], tf.int64),
+        "is_real_example": tf.io.FixedLenFeature([], tf.int64),
     }
 
     # 输入序列特征列匹配
     sequence_features = {
-        "input_ids": tf.FixedLenSequenceFeature([FLAGS.max_token_length], tf.int64),
+        "input_ids": tf.io.FixedLenSequenceFeature([FLAGS.max_token_length], tf.int64),
     }
 
     def _decode_record(record, context_features, sequence_features):
@@ -446,8 +459,8 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
         解析tf.record文件数据
         """
         # 解析单个样本
-        context_output, feature_list_output = tf.parse_single_sequence_example(record, context_features,
-                                                                               sequence_features)
+        context_output, feature_list_output = tf.io.parse_single_sequence_example(record, context_features,
+                                                                                  sequence_features)
 
         # tf.Example only supports tf.int64, but the TPU only supports tf.int32.
         # So cast all int64 to int32.
@@ -467,14 +480,14 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
         # with tf.Session() as sess:
         #     # sess.run(init)
 
-        print("\n\nfeature_list_output: ")
+        # print("\n\nfeature_list_output: ")
         for name in list(feature_list_output.keys()):
             t = feature_list_output[name]
-            print("key={}, value={}".format(name, t))
+            # print("key={}, value={}".format(name, t))
             # input_ids
             # t = torch.tensor(sess.run(t).eval(), dtype=torch.long)
             example[name] = t
-            print("name={}, t={}".format(name, t.shape))
+            # print("name={}, t={}".format(name, t.shape))
 
         # print("example={}".format(example))
         return example
@@ -495,7 +508,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
             dataset = dataset.shuffle(buffer_size=100)
 
         # 应用批处理batch size
-        dataset = dataset.apply(tf.contrib.data.map_and_batch(
+        dataset = dataset.apply(tf.data.experimental.map_and_batch(
             lambda record: _decode_record(record, context_features, sequence_features),
             batch_size=batch_size,
             drop_remainder=drop_remainder))
@@ -518,23 +531,22 @@ def serving_input_receiver_fn():
     -------
     tf.estimator.export.ServingInputReceiver
     """
-    input_ids = tf.placeholder(dtype=tf.int64, shape=[None, None], name='input_ids')
-    label_ids = tf.placeholder(dtype=tf.int64, shape=[None, None], name='label_ids')
-    is_real_example = tf.placeholder(dtype=tf.int64, shape=[None, None], name='is_real_example')
+    input_ids = tf.compat.v1.placeholder(dtype=tf.int64, shape=[None, None], name='input_ids')
+    label_ids = tf.compat.v1.placeholder(dtype=tf.int64, shape=[None, None], name='label_ids')
+    sequence_lengths = tf.compat.v1.placeholder(dtype=tf.int64, shape=[None, None], name='sequence_lengths')
+    is_real_example = tf.compat.v1.placeholder(dtype=tf.int64, shape=[None, None], name='is_real_example')
 
     features = {'input_ids': input_ids,
                 "label_ids": label_ids,
+                "sequence_lengths": sequence_lengths,
                 "is_real_example": is_real_example,
                 }
-    receiver_tensors = {'input_ids': input_ids,
-                        "label_ids": label_ids,
-                        "is_real_example": is_real_example,
-                        }
-    return tf.estimator.export.ServingInputReceiver(features, receiver_tensors)
+
+    return tf.estimator.export.ServingInputReceiver(features, features)
 
 
-def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
-                 label_ids, num_labels, use_one_hot_embeddings, label_weights,
+def create_model(bert_config, is_training, input_ids, sequence_lengths, init_checkpoint,
+                 label_ids, num_labels, use_one_hot_embeddings, use_tpu,
                  cell="lstm",
                  num_layers=1,
                  dropout_rate=0.1,
@@ -546,51 +558,78 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
         bert_config:
         is_training:
         input_ids:
-        input_mask:
-        segment_ids:
+        sequence_lengths: list of size: [batch_size, max_len_length], 值为每个序列的真实长度。
         label_ids: [batch_size=32, ]
         num_labels: int, 类别个数
         use_one_hot_embeddings:
-        label_weights: [batch_size=32, num_labels=2]
 
     """
-    # output_layer: [batch_size=32, hidden_size=768]
-    # 获取对应的embedding 输入数据[batch_size, seq_length, embedding_size]
-    # with tf.Session():
-    #     print(
-    #         "{} input_ids={}".format(input_ids.shape, tf.reshape(input_ids, [-1, FLAGS.max_token_length]).eval().shape))
-
-    # with tf.Session() as sess:
-    #     input_ids = torch.tensor(sess.run(input_ids).eval(), dtype=torch.long)
-    #     sess.close()
-
+    batch_size = tf.shape(input_ids)[0]
+    print("1: {} input_ids={}".format(type(input_ids), input_ids.shape))
     input_ids = tf.reshape(input_ids, [-1, FLAGS.max_token_length])
-    _, embedding = model(input_ids)
+    print("2: {} input_ids={}".format(type(input_ids), input_ids.shape))
 
-    print("input_ids={}".format(input_ids.shape))
+    inputs = {"input_ids": input_ids, "label_ids": label_ids}
+    model = TFBertMainLayer(
+        config=bert_config,
+        name="bert-embedding"
+    )
+    _, embedding = model(inputs)
+
+    # print("3 input_ids={}".format(input_ids.shape))
     # hidden_size: 768
 
     print("{} embedding".format(embedding.shape))
 
-    hidden_size = embedding.shape[-1].value
-
-    max_seq_length = embedding.shape[1].value
+    hidden_size = embedding.shape[-1]
+    max_seq_length = FLAGS.max_seq_length
+    print("batch_size: {}".format(batch_size))
+    print("hidden_size: {}".format(hidden_size))
+    print("max_seq_length: {}".format(max_seq_length))
 
     # 算序列真实长度
-    used = tf.sign(tf.abs(input_ids))
-    true_lengths = tf.reduce_sum(used, reduction_indices=1)  # [batch_size] 大小的向量，包含了当前batch中的真实序列长度
+    print("1 sequence_lengths: {}".format(sequence_lengths))
+    used = tf.sign(tf.abs(sequence_lengths))
+    sequence_lengths = tf.reduce_sum(used, 1)  # [batch_size] 大小的向量，包含了当前batch中的序列长度
+    print("2 sequence_lengths: {}".format(sequence_lengths))
 
-    print("{} true_lengths".format(true_lengths))
     # 添加Bi-LSTM+CRF Layer
+    embedding = tf.reshape(embedding, [batch_size, -1, hidden_size])
+    print("{} embedding".format(embedding.shape))
     blstm_crf = BiLSTM_CRF(embedding_inputs=embedding, hidden_units_num=hidden_size, cell_type=cell,
                            num_layers=num_layers,
-                           dropout_rate=dropout_rate, initializers=initializers, num_labels=num_labels,
-                           sequence_length=max_seq_length, tag_indices=label_ids, sequence_lengths=true_lengths,
+                           dropout_rate=dropout_rate, num_labels=num_labels,
+                           max_seq_length=max_seq_length, tag_indices=label_ids, sequence_lengths=sequence_lengths,
                            is_training=is_training)
+    print("blstm_crf={}".format(blstm_crf))
+    (loss, per_example_loss, logits, probabilities) = blstm_crf.add_blstm_crf_layer(crf_only=False)
+    print("loss={}, per_example_loss={}, logits={}, probabilities={}".format(loss, per_example_loss, logits,
+                                                                             probabilities))
 
-    (loss, per_example_loss, logits, probabilities) = blstm_crf.add_blstm_crf_layer(crf_only=True)
+    tvars = tf.compat.v1.trainable_variables()
+    initialized_variable_names = {}
+    scaffold_fn = None
+    if init_checkpoint:
+        (assignment_map, initialized_variable_names
+         ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+        if use_tpu:
 
-    return (loss, per_example_loss, logits, probabilities)
+            def tpu_scaffold():
+                tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
+                return tf.compat.v1.train.Scaffold()
+
+            scaffold_fn = tpu_scaffold
+        else:
+            tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
+
+    tf.compat.v1.logging.info("**** Trainable Variables ****")
+    for var in tvars:
+        init_string = ""
+        if var.name in initialized_variable_names:
+            init_string = ", *INIT_FROM_CKPT*"
+        tf.compat.v1.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
+                                  init_string)
+    return (loss, per_example_loss, logits, probabilities, scaffold_fn)
 
 
 def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
@@ -624,53 +663,31 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         """
 
         print("features={}".format(features))
-        tf.logging.info("*** Features ***")
+        tf.compat.v1.logging.info("*** Features ***")
         for name in sorted(features.keys()):
-            tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+            tf.compat.v1.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
 
         input_ids = features["input_ids"]
         label_ids = features["label_ids"]
+        sequence_lengths = features["sequence_lengths"]
         if "is_real_example" in features:
             # 类型强制转换为tf.float32
             is_real_example = tf.cast(features["is_real_example"], dtype=tf.float32)
         else:
             # 创建一个将所有元素都设置为1的张量Tensor.
-            is_real_example = tf.ones(tf.shape(label_ids), dtype=tf.float32)
+            is_real_example = tf.ones(tf.shape(input=label_ids), dtype=tf.float32)
 
         # 根据mode判断是否为训练模式
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
         # 基于特征数据创建模型，并计算loss等
-        print("create_model:\ninput_ids={}".format(input_ids.shape))
-        print("label_ids={}".format(label_ids.shape))
-        (total_loss, per_example_loss, logits, probabilities) = create_model(
-            bert_config, is_training, input_ids, None, None, label_ids,
-            num_labels, use_one_hot_embeddings, None)
+        print("create_model:\n{} input_ids={}".format(input_ids.shape, input_ids))
+        print("{} label_ids={}".format(label_ids.shape, label_ids))
 
-        print("total_loss={}".format(total_loss))
-        tvars = tf.trainable_variables()
-        initialized_variable_names = {}
-        scaffold_fn = None
-        if init_checkpoint:
-            (assignment_map, initialized_variable_names
-             ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-            if use_tpu:
-
-                def tpu_scaffold():
-                    tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-                    return tf.train.Scaffold()
-
-                scaffold_fn = tpu_scaffold
-            else:
-                tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
-        tf.logging.info("**** Trainable Variables ****")
-        for var in tvars:
-            init_string = ""
-            if var.name in initialized_variable_names:
-                init_string = ", *INIT_FROM_CKPT*"
-            tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                            init_string)
+        # 构建模型网络结构
+        (total_loss, per_example_loss, logits, probabilities, scaffold_fn) = create_model(
+            bert_config, is_training, input_ids, sequence_lengths, init_checkpoint, label_ids,
+            num_labels, use_one_hot_embeddings, use_tpu)
 
         # 训练模式
         if mode == tf.estimator.ModeKeys.TRAIN:
@@ -687,7 +704,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                 train_op = optimization.create_optimizer(
                     total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
 
-                output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
                     mode=mode,
                     loss=total_loss,
                     train_op=train_op,
@@ -695,13 +712,15 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         # 评估模式
         elif mode == tf.estimator.ModeKeys.EVAL:
             def metric_fn(per_example_loss, label_ids, logits, is_real_example):
-                predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
-                accuracy = tf.metrics.accuracy(
+                predictions = tf.argmax(input=logits, axis=-1, output_type=tf.int32)
+                accuracy = tf.compat.v1.metrics.accuracy(
                     labels=label_ids, predictions=predictions, weights=is_real_example)
-                loss = tf.metrics.mean(values=per_example_loss, weights=is_real_example)
+                loss = tf.compat.v1.metrics.mean(values=per_example_loss, weights=is_real_example)
                 # add more metrics
-                pr, pr_op = tf.metrics.precision(labels=label_ids, predictions=predictions, weights=is_real_example)
-                re, re_op = tf.metrics.recall(labels=label_ids, predictions=predictions, weights=is_real_example)
+                pr, pr_op = tf.compat.v1.metrics.precision(labels=label_ids, predictions=predictions,
+                                                           weights=is_real_example)
+                re, re_op = tf.compat.v1.metrics.recall(labels=label_ids, predictions=predictions,
+                                                        weights=is_real_example)
                 # if FLAGS.classifier_mode == "multi-class":
                 #     # multi-class
                 #     # pr, pr_op = tf_metrics.precision(label_ids, predictions, num_labels, average="macro")
@@ -730,7 +749,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                 )
             else:
                 # eval on single-gpu only
-                output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
                     mode=mode,
                     loss=total_loss,
                     eval_metrics=eval_metrics,
@@ -738,14 +757,14 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         else:
             # tf.estimator.ModeKeys.PREDICT 预测模式
             # 基于logits计算最大的概率所在索引的label
-            predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
+            predictions = tf.argmax(input=logits, axis=-1, output_type=tf.int32)
             if FLAGS.num_gpu_cores > 1:
                 # 多GPUs
                 output_spec = tf.estimator.EstimatorSpec(
                     mode=mode,
                     predictions={"probabilities": probabilities, "predictions": predictions})
             else:
-                output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                output_spec = tf.compat.v1.estimator.tpu.TPUEstimatorSpec(
                     mode=mode,
                     predictions={"probabilities": probabilities, "predictions": predictions},
                     scaffold_fn=scaffold_fn)
@@ -754,14 +773,17 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     return model_fn
 
 
-def print_cls_report(fileTest=os.path.join(FLAGS.data_dir, FLAGS.train_file),
-                     fileResult=os.path.join(FLAGS.output_dir, "test_results.tsv"),
-                     sep="\t",
-                     header="label"):
+def print_cls_report(labels,
+                     fileTest=os.path.join(FLAGS.output_dir, "test_labels.tsv"),
+                     fileResult=os.path.join(FLAGS.output_dir, "test_results.tsv")):
     try:
-        y_true = pd.read_csv(fileTest, sep=sep)[header]
-        y_pred = [float(i.strip()) for i in open(fileResult, "r").readlines()]
-        rp = classification_report(y_true, y_pred, digits=4)
+        y_true = [i.strip() for i in open(fileTest, "r").readlines()]
+        y_pred = [i.strip() for i in open(fileResult, "r").readlines()]
+        rp = classification_report(y_true, y_pred, digits=4, labels=labels)
+        print("report:\n{}".format(rp))
+        # 去掉O other 标签
+        labels.remove(labels[0])
+        rp = classification_report(y_true, y_pred, digits=4, labels=labels)
         print("report:\n{}".format(rp))
     except Exception as e:
         print("Error: {}".format(repr(e)))
@@ -769,7 +791,7 @@ def print_cls_report(fileTest=os.path.join(FLAGS.data_dir, FLAGS.train_file),
 
 
 def main(_):
-    tf.logging.set_verbosity(tf.logging.INFO)
+    tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
 
     processors = {
         "disc": DiscProcessor,
@@ -782,7 +804,9 @@ def main(_):
         raise ValueError(
             "At least one of `do_train`, `do_eval` or `do_predict' must be True.")
 
-    bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+    # bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+    bert_config = BertConfig()
+    tf.compat.v1.logging.info("bert_config={}".format(bert_config))
 
     if FLAGS.max_seq_length > bert_config.max_position_embeddings:
         raise ValueError(
@@ -792,9 +816,9 @@ def main(_):
 
     # local_device_protos = device_lib.list_local_devices()
     # FLAGS.num_gpu_cores = min(sum([1 for d in local_device_protos if d.device_type == 'GPU']), FLAGS.num_gpu_cores)
-    tf.logging.info(f"Info: {FLAGS.num_gpu_cores} GPUs found")
+    tf.compat.v1.logging.info(f"Info: {FLAGS.num_gpu_cores} GPUs found")
 
-    tf.gfile.MakeDirs(FLAGS.output_dir)
+    tf.io.gfile.makedirs(FLAGS.output_dir)
 
     task_name = FLAGS.task_name.lower()
 
@@ -805,6 +829,7 @@ def main(_):
 
     # 获取标签列表
     label_list = processor.get_labels()
+    label_map = processor.get_label_map()
     num_labels = len(label_list)
 
     train_examples = None
@@ -827,24 +852,24 @@ def main(_):
         use_one_hot_embeddings=FLAGS.use_tpu)
 
     if FLAGS.use_tpu and FLAGS.tpu_name:
-        tf.logging.info(f"***** {FLAGS.tpu_name} TPU Running *****")
-        tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+        tf.compat.v1.logging.info(f"***** {FLAGS.tpu_name} TPU Running *****")
+        tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
             FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
-        is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-        run_config = tf.contrib.tpu.RunConfig(
+        is_per_host = tf.compat.v1.estimator.tpu.InputPipelineConfig.PER_HOST_V2
+        run_config = tf.compat.v1.estimator.tpu.RunConfig(
             cluster=tpu_cluster_resolver,
             master=FLAGS.master,
             model_dir=FLAGS.output_dir,
             save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-            tpu_config=tf.contrib.tpu.TPUConfig(
+            tpu_config=tf.compat.v1.estimator.tpu.TPUConfig(
                 iterations_per_loop=FLAGS.iterations_per_loop,
                 num_shards=FLAGS.num_tpu_cores,
                 per_host_input_for_training=is_per_host))
 
         # If TPU is not available, this will fall back to normal Estimator on CPU
         # or GPU.
-        estimator = tf.contrib.tpu.TPUEstimator(
+        estimator = tf.compat.v1.estimator.tpu.TPUEstimator(
             use_tpu=FLAGS.use_tpu,
             model_fn=model_fn,
             config=run_config,
@@ -854,24 +879,24 @@ def main(_):
 
     elif FLAGS.num_gpu_cores > 1:
         # multi-gpus 训练
-        tf.logging.info(f"***** {FLAGS.num_gpu_cores} GPUs Running *****")
+        tf.compat.v1.logging.info(f"***** {FLAGS.num_gpu_cores} GPUs Running *****")
         # 1.先定义分布式训练的镜像策略：MirroredStrategy
-        dist_strategy = tf.contrib.distribute.MirroredStrategy(
-            num_gpus=FLAGS.num_gpu_cores,  # 使用gpu的个数
-            cross_device_ops=AllReduceCrossDeviceOps('nccl', num_packs=FLAGS.num_gpu_cores),  # 各设备之间的数据操作方式
-            # cross_device_ops=AllReduceCrossDeviceOps('hierarchical_copy'),
-        )
+        # dist_strategy = tf.contrib.distribute.MirroredStrategy(
+        #     num_gpus=FLAGS.num_gpu_cores,  # 使用gpu的个数
+        #     # cross_device_ops=AllReduceCrossDeviceOps('nccl', num_packs=FLAGS.num_gpu_cores),  # 各设备之间的数据操作方式
+        #     # cross_device_ops=AllReduceCrossDeviceOps('hierarchical_copy'),
+        # )
         # 2.设置会话session配置
-        session_config = tf.ConfigProto(
+        session_config = tf.compat.v1.ConfigProto(
             inter_op_parallelism_threads=0,
             intra_op_parallelism_threads=0,
             allow_soft_placement=True,
-            gpu_options=tf.GPUOptions(allow_growth=True))
+            gpu_options=tf.compat.v1.GPUOptions(allow_growth=True))
 
         # 3.设置运行配置run_config
-        run_config = tf.contrib.tpu.RunConfig(
-            train_distribute=dist_strategy,
-            eval_distribute=dist_strategy,
+        run_config = tf.compat.v1.estimator.tpu.RunConfig(
+            # train_distribute=dist_strategy,
+            # eval_distribute=dist_strategy,
             model_dir=FLAGS.output_dir,
             session_config=session_config,
             save_checkpoints_steps=FLAGS.save_checkpoints_steps,
@@ -883,22 +908,22 @@ def main(_):
             params={"batch_size": FLAGS.train_batch_size})
     else:
         # 单GPU或者CPU训练
-        tf.logging.info("***** Single GPU/CPU Running *****")
+        tf.compat.v1.logging.info("***** Single GPU/CPU Running *****")
         tpu_cluster_resolver = None
-        is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-        run_config = tf.contrib.tpu.RunConfig(
+        is_per_host = tf.compat.v1.estimator.tpu.InputPipelineConfig.PER_HOST_V2
+        run_config = tf.compat.v1.estimator.tpu.RunConfig(
             cluster=tpu_cluster_resolver,
             master=FLAGS.master,
             model_dir=FLAGS.output_dir,
             save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-            tpu_config=tf.contrib.tpu.TPUConfig(
+            tpu_config=tf.compat.v1.estimator.tpu.TPUConfig(
                 iterations_per_loop=FLAGS.iterations_per_loop,
                 num_shards=FLAGS.num_tpu_cores,
                 per_host_input_for_training=is_per_host))
 
         # If TPU is not available, this will fall back to normal Estimator on CPU
         # or GPU.
-        estimator = tf.contrib.tpu.TPUEstimator(
+        estimator = tf.compat.v1.estimator.tpu.TPUEstimator(
             use_tpu=FLAGS.use_tpu,
             model_fn=model_fn,
             config=run_config,
@@ -913,12 +938,12 @@ def main(_):
         # ------------- 1.Train ------------- #
         # 1.1 将文本预处理，并存储为tf.record格式文件
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
-        file_based_convert_examples_to_features(train_examples, label_list, FLAGS.max_seq_length,
+        file_based_convert_examples_to_features(train_examples, label_map, FLAGS.max_seq_length,
                                                 FLAGS.max_token_length, tokenizer, train_file)
-        tf.logging.info("***** Running training *****")
-        tf.logging.info("  Num examples = %d", len(train_examples))
-        tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
-        tf.logging.info("  Num steps = %d", num_train_steps)
+        tf.compat.v1.logging.info("***** Running training *****")
+        tf.compat.v1.logging.info("  Num examples = %d", len(train_examples))
+        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.train_batch_size)
+        tf.compat.v1.logging.info("  Num steps = %d", num_train_steps)
         # 1.2 基于tf.record格式文件进行迭代batch处理样本
         train_input_fn = file_based_input_fn_builder(
             input_file=train_file,
@@ -939,13 +964,13 @@ def main(_):
 
         eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
         file_based_convert_examples_to_features(
-            eval_examples, label_list, FLAGS.max_seq_length, FLAGS.max_token_length, tokenizer, eval_file)
+            eval_examples, label_map, FLAGS.max_seq_length, FLAGS.max_token_length, tokenizer, eval_file)
 
-        tf.logging.info("***** Running evaluation *****")
-        tf.logging.info("  Num examples = %d (%d actual, %d padding)",
-                        len(eval_examples), num_actual_eval_examples,
-                        len(eval_examples) - num_actual_eval_examples)
-        tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+        tf.compat.v1.logging.info("***** Running evaluation *****")
+        tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
+                                  len(eval_examples), num_actual_eval_examples,
+                                  len(eval_examples) - num_actual_eval_examples)
+        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
         # This tells the estimator to run through the entire set.
         eval_steps = None
@@ -977,15 +1002,15 @@ def main(_):
             eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps, throttle_secs=0)
 
             tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
-            tf.logging.info("***** Training & Evaluating completed*****")
+            tf.compat.v1.logging.info("***** Training & Evaluating completed*****")
         else:
             estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
-            tf.logging.info("***** Training completed*****")
+            tf.compat.v1.logging.info("***** Training completed*****")
 
         # export SavedModel format for TF serving
         export_dir_base = os.path.join(FLAGS.output_dir, 'saved_model')
         estimator.export_saved_model(export_dir_base, serving_input_receiver_fn)
-        tf.logging.info("***** SavedModel export completed*****")
+        tf.compat.v1.logging.info("***** SavedModel export completed*****")
 
     elif FLAGS.do_eval:
         eval_examples = processor.get_dev_examples(FLAGS.data_dir)
@@ -1001,13 +1026,13 @@ def main(_):
 
         eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
         file_based_convert_examples_to_features(
-            eval_examples, label_list, FLAGS.max_seq_length, FLAGS.max_token_length, tokenizer, eval_file)
+            eval_examples, label_map, FLAGS.max_seq_length, FLAGS.max_token_length, tokenizer, eval_file)
 
-        tf.logging.info("***** Running evaluation *****")
-        tf.logging.info("  Num examples = %d (%d actual, %d padding)",
-                        len(eval_examples), num_actual_eval_examples,
-                        len(eval_examples) - num_actual_eval_examples)
-        tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+        tf.compat.v1.logging.info("***** Running evaluation *****")
+        tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
+                                  len(eval_examples), num_actual_eval_examples,
+                                  len(eval_examples) - num_actual_eval_examples)
+        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
         # This tells the estimator to run through the entire set.
         eval_steps = None
@@ -1027,12 +1052,12 @@ def main(_):
         result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
 
         output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
-        with tf.gfile.GFile(output_eval_file, "w") as writer:
-            tf.logging.info("***** Eval results *****")
+        with tf.io.gfile.GFile(output_eval_file, "w") as writer:
+            tf.compat.v1.logging.info("***** Eval results *****")
             for key in sorted(result.keys()):
-                tf.logging.info("  %s = %s", key, str(result[key]))
+                tf.compat.v1.logging.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
-        tf.logging.info("***** Evaluation completed*****")
+        tf.compat.v1.logging.info("***** Evaluation completed*****")
 
     if FLAGS.do_predict:
         predict_examples = processor.get_test_examples(FLAGS.data_dir)
@@ -1046,15 +1071,22 @@ def main(_):
                 predict_examples.append(PaddingInputExample())
 
         predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
-        file_based_convert_examples_to_features(predict_examples, label_list,
+
+        with open(os.path.join(FLAGS.output_dir, "test_labels.tsv"), "w") as fw:
+            y_true = []
+            for i in predict_examples:
+                y_true += i.labels
+            y_true = [str(i) + "\n" for i in y_true]
+            fw.writelines(y_true)
+        file_based_convert_examples_to_features(predict_examples, label_map,
                                                 FLAGS.max_seq_length, FLAGS.max_token_length, tokenizer,
                                                 predict_file)
 
-        tf.logging.info("***** Running prediction*****")
-        tf.logging.info("  Num examples = %d (%d actual, %d padding)",
-                        len(predict_examples), num_actual_predict_examples,
-                        len(predict_examples) - num_actual_predict_examples)
-        tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+        tf.compat.v1.logging.info("***** Running prediction*****")
+        tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
+                                  len(predict_examples), num_actual_predict_examples,
+                                  len(predict_examples) - num_actual_predict_examples)
+        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
 
         predict_drop_remainder = True if FLAGS.use_tpu else False
         predict_input_fn = file_based_input_fn_builder(
@@ -1066,29 +1098,26 @@ def main(_):
         result = estimator.predict(input_fn=predict_input_fn)
 
         output_predict_file = os.path.join(FLAGS.output_dir, "test_results.tsv")
-        with tf.gfile.GFile(output_predict_file, "w") as writer:
+        with tf.io.gfile.GFile(output_predict_file, "w") as writer:
             num_written_lines = 0
-            tf.logging.info("***** Predict results *****")
+            tf.compat.v1.logging.info("***** Predict results *****")
             for (i, prediction) in enumerate(result):
                 probabilities = prediction["probabilities"]
                 # 根据输出的索引id找到对应的label
-                y_pred = label_list[prediction["predictions"]]
                 if i <= 3:
-                    print(f"probabilities={probabilities}")
-                    print("y_pred={}".format(y_pred))
+                    print("i={}\nprediction={}".format(i, prediction))
+                    print("prediction={}\n\n".format(probabilities))
+                y_pred = [label_list[k] for k in prediction["predictions"]]
                 if i >= num_actual_predict_examples:
                     break
                 # output_line = "\t".join(
                 #     [str(class_probability) for class_probability in probabilities] + [str(y_pred)]) + "\n"
-                writer.write(str(y_pred) + "\n")
+                writer.write(str("\n".join(y_pred)) + "\n")
                 num_written_lines += 1
         assert num_written_lines == num_actual_predict_examples
-        tf.logging.info("***** Prediction completed*****")
-        # 打印输出分类任务的性能指标
-        print_cls_report(fileTest=os.path.join(FLAGS.data_dir, FLAGS.predict_file),
-                         fileResult=os.path.join(FLAGS.output_dir, "test_results.tsv"),
-                         sep="\t",
-                         header="label")
+        tf.compat.v1.logging.info("***** Prediction completed*****")
+        # 打印输出性能指标
+        print_cls_report(label_list)
 
 
 if __name__ == "__main__":
@@ -1097,4 +1126,4 @@ if __name__ == "__main__":
     flags.mark_flag_as_required("vocab_file")
     flags.mark_flag_as_required("bert_config_file")
     flags.mark_flag_as_required("output_dir")
-    tf.app.run()
+    tf.compat.v1.app.run()
