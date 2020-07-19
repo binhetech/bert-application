@@ -208,10 +208,10 @@ class InputFeatures(object):
         样本的输入特征数据初始化方法.
 
         Args:
-            input_ids: list of list, [max_seq_length, max_token_length]
-            label_ids: list of int, [max_seq_length, ]
-            sequence_lengths: list of int, [max_seq_length, ], 值为每个序列的真实长度。若大于0，则为真实序列，否则为padding的序列
-            is_real_example: boolean, 是否为真实样本， (否：padding的虚拟样本)
+            input_ids: list of list, size=[max_seq_length, max_token_length]
+            label_ids: list of int, size=[max_seq_length, ]
+            sequence_lengths: list of int, size=[max_seq_length, ], 列表中的值为每个序列的真实长度。若大于0，则为真实序列，否则为padding的序列
+            is_real_example: boolean, 是否为真实样本， (若为否：则为填充padding的虚拟样本)
 
         """
         self.input_ids = input_ids
@@ -301,9 +301,9 @@ class DiscProcessor(DataProcessor):
         for (i, line) in enumerate(lines):
             if i <= 3:
                 print("i={}, line={}".format(i, line))
-            if len(examples) >= 100:
-                print("i={}, examples[-1].texts={}".format(i, examples[-1].texts))
-                break
+            # if len(examples) >= 100:
+            #     print("i={}, examples[-1].texts={}".format(i, examples[-1].texts))
+            #     break
             if len(line) < 2:
                 # new example
                 guid = "%s-%s" % (set_type, enum)
@@ -313,7 +313,7 @@ class DiscProcessor(DataProcessor):
             else:
                 if set_type == "test":
                     text = tokenization.convert_to_unicode(line[0])
-                    label = "O"  # "other" label
+                    label = tokenization.convert_to_unicode(line[1])  # "other" label
                 else:
                     text = tokenization.convert_to_unicode(line[0])
                     label = tokenization.convert_to_unicode(line[1])
@@ -329,10 +329,13 @@ def convert_single_example(ex_index, example, label_map, max_seq_length, max_tok
     Args:
         ex_index: int, example index
         example: SequenceExample
-        label_map: dict, label2id, 全部标签类列表2id
+        label_map: dict, label2id, 全部标签列表2id索引
         max_seq_length: int, 最大序列长度，即句子个数， 默认64
         max_token_length: int, 最大句子中单词token长度，一般为128
-        tokenizer: 分词器
+        tokenizer: 字符串token化，编码为数字id
+
+    Return:
+        feature: InputFeatures
 
     """
 
@@ -344,10 +347,15 @@ def convert_single_example(ex_index, example, label_map, max_seq_length, max_tok
             is_real_example=False,
         )
 
+    # 将字符串编码为数值化id
     input_ids = [tokenizer.encode(tokens, max_length=max_token_length, pad_to_max_length=True, truncation=True) for
                  tokens in example.texts[:max_seq_length]]
 
-    sequence_lengths = [len(i) for i in input_ids]
+    def _func(input_id):
+        # 统计非padding token数，即真实tokens长度
+        return sum([1 for i in input_id if i != tokenizer.pad_token_id])
+
+    sequence_lengths = [_func(i) for i in input_ids]
     if len(input_ids) < max_seq_length:
         padding_input_ids = [[tokenizer.pad_token_id] * max_token_length] * (max_seq_length - len(input_ids))
         input_ids += padding_input_ids
@@ -360,6 +368,7 @@ def convert_single_example(ex_index, example, label_map, max_seq_length, max_tok
         label_ids += [0] * (max_seq_length - len(label_ids))
 
     assert len(input_ids) == max_seq_length
+    assert len(input_ids[0]) == max_token_length
     assert len(label_ids) == max_seq_length
     assert len(sequence_lengths) == max_seq_length
 
@@ -367,7 +376,7 @@ def convert_single_example(ex_index, example, label_map, max_seq_length, max_tok
         tf.compat.v1.logging.info("*** Example ***")
         tf.compat.v1.logging.info("guid: {}".format(example.guid))
         tf.compat.v1.logging.info("{} input_ids: {}".format(np.array(input_ids).shape, input_ids))
-        tf.compat.v1.logging.info("{} labels_ids: {}".format(len(label_ids), label_ids))
+        tf.compat.v1.logging.info("{} label_ids: {}".format(len(label_ids), label_ids))
         tf.compat.v1.logging.info("{} sequence_lengths: {}".format(len(sequence_lengths), sequence_lengths))
 
     # 转换成InputFeatures对象
@@ -565,9 +574,9 @@ def create_model(bert_config, is_training, input_ids, sequence_lengths, init_che
 
     """
     batch_size = tf.shape(input_ids)[0]
-    print("1: {} input_ids={}".format(type(input_ids), input_ids.shape))
+    # print("1: {} input_ids={}".format(type(input_ids), input_ids.shape))
     input_ids = tf.reshape(input_ids, [-1, FLAGS.max_token_length])
-    print("2: {} input_ids={}".format(type(input_ids), input_ids.shape))
+    # print("2: {} input_ids={}".format(type(input_ids), input_ids.shape))
 
     inputs = {"input_ids": input_ids, "label_ids": label_ids}
     model = TFBertMainLayer(
@@ -579,32 +588,32 @@ def create_model(bert_config, is_training, input_ids, sequence_lengths, init_che
     # print("3 input_ids={}".format(input_ids.shape))
     # hidden_size: 768
 
-    print("{} embedding".format(embedding.shape))
+    # print("{} embedding".format(embedding.shape))
 
     hidden_size = embedding.shape[-1]
     max_seq_length = FLAGS.max_seq_length
-    print("batch_size: {}".format(batch_size))
-    print("hidden_size: {}".format(hidden_size))
-    print("max_seq_length: {}".format(max_seq_length))
+    # print("batch_size: {}".format(batch_size))
+    # print("hidden_size: {}".format(hidden_size))
+    # print("max_seq_length: {}".format(max_seq_length))
 
     # 算序列真实长度
-    print("1 sequence_lengths: {}".format(sequence_lengths))
+    # print("1 sequence_lengths: {}".format(sequence_lengths))
     used = tf.sign(tf.abs(sequence_lengths))
     sequence_lengths = tf.reduce_sum(used, 1)  # [batch_size] 大小的向量，包含了当前batch中的序列长度
-    print("2 sequence_lengths: {}".format(sequence_lengths))
+    # print("2 sequence_lengths: {}".format(sequence_lengths))
 
     # 添加Bi-LSTM+CRF Layer
     embedding = tf.reshape(embedding, [batch_size, -1, hidden_size])
-    print("{} embedding".format(embedding.shape))
+    # print("{} embedding".format(embedding.shape))
     blstm_crf = BiLSTM_CRF(embedding_inputs=embedding, hidden_units_num=hidden_size, cell_type=cell,
                            num_layers=num_layers,
                            dropout_rate=dropout_rate, num_labels=num_labels,
                            max_seq_length=max_seq_length, tag_indices=label_ids, sequence_lengths=sequence_lengths,
                            is_training=is_training)
-    print("blstm_crf={}".format(blstm_crf))
+    # print("blstm_crf={}".format(blstm_crf))
     (loss, per_example_loss, logits, probabilities) = blstm_crf.add_blstm_crf_layer(crf_only=False)
-    print("loss={}, per_example_loss={}, logits={}, probabilities={}".format(loss, per_example_loss, logits,
-                                                                             probabilities))
+    # print("loss={}, per_example_loss={}, logits={}, probabilities={}".format(loss, per_example_loss, logits,
+    #                                                                          probabilities))
 
     tvars = tf.compat.v1.trainable_variables()
     initialized_variable_names = {}
@@ -681,8 +690,8 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
         # 基于特征数据创建模型，并计算loss等
-        print("create_model:\n{} input_ids={}".format(input_ids.shape, input_ids))
-        print("{} label_ids={}".format(label_ids.shape, label_ids))
+        # print("create_model:\n{} input_ids={}".format(input_ids.shape, input_ids))
+        # print("{} label_ids={}".format(label_ids.shape, label_ids))
 
         # 构建模型网络结构
         (total_loss, per_example_loss, logits, probabilities, scaffold_fn) = create_model(
@@ -779,10 +788,14 @@ def print_cls_report(labels,
     try:
         y_true = [i.strip() for i in open(fileTest, "r").readlines()]
         y_pred = [i.strip() for i in open(fileResult, "r").readlines()]
+        y_true = [x[2:] if len(x) == 4 else x for x in y_true]
+        y_pred = [x[2:] if len(x) == 4 else x for x in y_pred]
+        labels = [x[2:] if len(x) == 4 else x for x in labels]
+        labels = list(set(labels))
         rp = classification_report(y_true, y_pred, digits=4, labels=labels)
         print("report:\n{}".format(rp))
         # 去掉O other 标签
-        labels.remove(labels[0])
+        labels.remove("O")
         rp = classification_report(y_true, y_pred, digits=4, labels=labels)
         print("report:\n{}".format(rp))
     except Exception as e:
@@ -1075,9 +1088,10 @@ def main(_):
         with open(os.path.join(FLAGS.output_dir, "test_labels.tsv"), "w") as fw:
             y_true = []
             for i in predict_examples:
-                y_true += i.labels
+                y_true += i.labels[:FLAGS.max_seq_length]
             y_true = [str(i) + "\n" for i in y_true]
             fw.writelines(y_true)
+            print("{} test_labels writing...".format(len(y_true)))
         file_based_convert_examples_to_features(predict_examples, label_map,
                                                 FLAGS.max_seq_length, FLAGS.max_token_length, tokenizer,
                                                 predict_file)
@@ -1101,13 +1115,14 @@ def main(_):
         with tf.io.gfile.GFile(output_predict_file, "w") as writer:
             num_written_lines = 0
             tf.compat.v1.logging.info("***** Predict results *****")
-            for (i, prediction) in enumerate(result):
-                probabilities = prediction["probabilities"]
+            for (i, (example, prediction)) in enumerate(zip(predict_examples, result)):
+                # probabilities = prediction["probabilities"]
                 # 根据输出的索引id找到对应的label
                 if i <= 3:
                     print("i={}\nprediction={}".format(i, prediction))
-                    print("prediction={}\n\n".format(probabilities))
-                y_pred = [label_list[k] for k in prediction["predictions"]]
+                    # print("prediction={}\n\n".format(probabilities))
+                y_pred = [label_list[k] for k, j in
+                          zip(prediction["predictions"], example.labels[:FLAGS.max_seq_length])]
                 if i >= num_actual_predict_examples:
                     break
                 # output_line = "\t".join(
