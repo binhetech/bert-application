@@ -89,6 +89,8 @@ flags.DEFINE_integer(
     "max_seq_length", 64,
     "The maximum total input sequence length")
 
+flags.DEFINE_integer("hidden_units_num", 256, "The hidden_units_num for LSTM")
+
 flags.DEFINE_integer(
     "max_token_length", 128,
     "The maximum total input token length after WordPiece tokenization. "
@@ -602,7 +604,8 @@ def create_model(bert_config, is_training, input_ids, sequence_lengths, init_che
     # )
     # _, embedding = model(inputs)
 
-    hidden_size = embedding.shape[-1]
+    embedding_size = embedding.shape[-1]
+    hidden_size = FLAGS.hidden_units_num
     max_seq_length = FLAGS.max_seq_length
     # print("batch_size: {}".format(batch_size))
     # print("hidden_size: {}".format(hidden_size))
@@ -615,7 +618,7 @@ def create_model(bert_config, is_training, input_ids, sequence_lengths, init_che
     # print("2 sequence_lengths: {}".format(sequence_lengths))
 
     # 添加Bi-LSTM+CRF Layer
-    embedding = tf.reshape(embedding, [batch_size, -1, hidden_size])
+    embedding = tf.reshape(embedding, [batch_size, -1, embedding_size])
     # print("{} embedding".format(embedding.shape))
     blstm_crf = BiLSTM_CRF(embedding_inputs=embedding, hidden_units_num=hidden_size, cell_type=cell,
                            num_layers=num_layers,
@@ -702,13 +705,13 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
             else:
                 tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
 
-        # tf.compat.v1.logging.info("**** Trainable Variables ****")
-        # for var in tvars:
-        #     init_string = ""
-        #     if var.name in initialized_variable_names:
-        #         init_string = ", *INIT_FROM_CKPT*"
-        #     tf.compat.v1.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-        #                               init_string)
+        tf.compat.v1.logging.info("**** Trainable Variables ****")
+        for var in tvars:
+            init_string = ""
+            if var.name in initialized_variable_names:
+                init_string = ", *INIT_FROM_CKPT*"
+            tf.compat.v1.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
+                                      init_string)
 
         # 训练模式
         if mode == tf.compat.v1.estimator.ModeKeys.TRAIN:
@@ -918,7 +921,7 @@ def main(_):
             inter_op_parallelism_threads=0,
             intra_op_parallelism_threads=0,
             allow_soft_placement=True,
-            gpu_options=tf.compat.v1.GPUOptions(allow_growth=True))
+            gpu_options=tf.compat.v1.GPUOptions(per_process_gpu_memory_fraction=0.9))  # 每个GPU的显存最大利用率
 
         # 3.设置运行配置run_config
         run_config = tf.compat.v1.estimator.tpu.RunConfig(
