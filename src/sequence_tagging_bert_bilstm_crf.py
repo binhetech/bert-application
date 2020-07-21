@@ -48,6 +48,8 @@ FLAGS = flags.FLAGS
 L = keras.layers
 # model = TFBertModel.from_pretrained('bert-base-cased')
 tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+# tokenizer = tokenization.FullTokenizer(
+#     vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
 
 ## Required parameters
 flags.DEFINE_string(
@@ -906,7 +908,7 @@ def main(_):
         # 1.先定义分布式训练的镜像策略：MirroredStrategy
         dist_strategy = tf.compat.v1.distribute.MirroredStrategy(
             devices=[f"/gpu:{str(i)}" for i in range(FLAGS.num_gpu_cores)],
-            cross_device_ops=tf.compat.v1.distribute.HierarchicalCopyAllReduce(num_packs=FLAGS.num_gpu_cores)
+            cross_device_ops=tf.compat.v1.distribute.NcclAllReduce(num_packs=FLAGS.num_gpu_cores)
             # num_gpus=FLAGS.num_gpu_cores,  # 使用gpu的个数
             # cross_device_ops=AllReduceCrossDeviceOps('nccl', num_packs=FLAGS.num_gpu_cores),  # 各设备之间的数据操作方式
             # cross_device_ops=AllReduceCrossDeviceOps('hierarchical_copy'),

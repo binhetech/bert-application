@@ -1,7 +1,7 @@
 import tensorflow as tf
 from tensorflow.contrib import crf
 
-from tensorflow.contrib import layers, rnn
+from tensorflow.contrib import rnn
 from tensorflow.contrib.layers.python.layers import initializers
 
 
@@ -53,7 +53,7 @@ class BiLSTM_CRF(object):
         """
         if self.is_training:
             # lstm input dropout rate i set 0.9 will get best score
-            self.embedding_inputs = tf.nn.dropout(self.embedding_inputs, 1 - self.dropout_rate)
+            self.embedding_inputs = tf.nn.dropout(self.embedding_inputs, keep_prob=1 - self.dropout_rate)
 
         if crf_only:
             # 只有CRF Layer
