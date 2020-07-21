@@ -1,8 +1,8 @@
 import tensorflow as tf
-from tensorflow_addons.text import crf
+from tensorflow.contrib import crf
 
-from tensorflow.keras import layers
-from tensorflow import initializers
+from tensorflow.contrib import layers, rnn
+from tensorflow.contrib.layers.python.layers import initializers
 
 
 class BiLSTM_CRF(object):
@@ -53,7 +53,7 @@ class BiLSTM_CRF(object):
         """
         if self.is_training:
             # lstm input dropout rate i set 0.9 will get best score
-            self.embedding_inputs = tf.nn.dropout(self.embedding_inputs, 1 - (1 - (1 - (self.dropout_rate))))
+            self.embedding_inputs = tf.nn.dropout(self.embedding_inputs, 1 - self.dropout_rate)
 
         if crf_only:
             # 只有CRF Layer
@@ -79,9 +79,10 @@ class BiLSTM_CRF(object):
         """
         cell_tmp = None
         if self.cell_type == 'lstm':
-            cell_tmp = layers.LSTMCell(self.hidden_units_num)
+            # rnn/layers.LSTMCell
+            cell_tmp = rnn.LSTMCell(self.hidden_units_num)
         elif self.cell_type == 'gru':
-            cell_tmp = layers.GRUCell(self.hidden_units_num)
+            cell_tmp = rnn.GRUCell(self.hidden_units_num)
         return cell_tmp
 
     def _bi_dir_rnn(self):
@@ -129,8 +130,9 @@ class BiLSTM_CRF(object):
         """
         with tf.compat.v1.variable_scope("project" if not name else name):
             with tf.compat.v1.variable_scope("hidden"):
+                # initializer=initializers.GlorotUniform()
                 W = tf.compat.v1.get_variable("W", shape=[self.hidden_units_num * 2, self.hidden_units_num],
-                                              dtype=tf.float32, initializer=initializers.GlorotUniform())
+                                              dtype=tf.float32, initializer=initializers.xavier_initializer())
 
                 b = tf.compat.v1.get_variable("b", shape=[self.hidden_units_num], dtype=tf.float32,
                                               initializer=tf.compat.v1.zeros_initializer())
@@ -140,7 +142,7 @@ class BiLSTM_CRF(object):
             # project to score of tags
             with tf.compat.v1.variable_scope("logits"):
                 W = tf.compat.v1.get_variable("W", shape=[self.hidden_units_num, self.num_labels],
-                                              dtype=tf.float32, initializer=initializers.GlorotUniform())
+                                              dtype=tf.float32, initializer=initializers.xavier_initializer())
 
                 b = tf.compat.v1.get_variable("b", shape=[self.num_labels], dtype=tf.float32,
                                               initializer=tf.compat.v1.zeros_initializer())
@@ -162,7 +164,7 @@ class BiLSTM_CRF(object):
         with tf.compat.v1.variable_scope("project"):
             with tf.compat.v1.variable_scope("logits"):
                 W = tf.compat.v1.get_variable("W", shape=[self.embedding_dims, self.num_labels],
-                                              dtype=tf.float32, initializer=initializers.GlorotUniform())
+                                              dtype=tf.float32, initializer=initializers.xavier_initializer())
 
                 b = tf.compat.v1.get_variable("b", shape=[self.num_labels], dtype=tf.float32,
                                               initializer=tf.compat.v1.zeros_initializer())
@@ -186,7 +188,7 @@ class BiLSTM_CRF(object):
             transition_params = tf.compat.v1.get_variable(
                 "transitions",
                 shape=[self.num_labels, self.num_labels],
-                initializer=initializers.GlorotUniform())
+                initializer=initializers.xavier_initializer())
             if self.tag_indices is None:
                 return None, transition_params
             else:

@@ -26,7 +26,7 @@ import re
 import numpy as np
 import six
 import tensorflow as tf
-from tensorflow_addons import layers
+from tensorflow.contrib import layers
 
 class BertConfig(object):
   """Configuration for `BertModel`."""

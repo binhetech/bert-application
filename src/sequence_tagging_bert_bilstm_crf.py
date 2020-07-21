@@ -36,7 +36,8 @@ import custom_optimization
 import modeling
 import optimization
 import tokenization
-from transformers import TFBertModel, TFBertMainLayer, BertConfig
+# from transformers import TFBertModel, TFBertMainLayer
+from transformers import BertConfig
 from transformers import BertTokenizer
 from bilstm_crf import BiLSTM_CRF
 
@@ -301,14 +302,15 @@ class DiscProcessor(DataProcessor):
         for (i, line) in enumerate(lines):
             if i <= 3:
                 print("i={}, line={}".format(i, line))
-            # if len(examples) >= 100:
+            # if len(examples) >= 500:
             #     print("i={}, examples[-1].texts={}".format(i, examples[-1].texts))
             #     break
             if len(line) < 2:
                 # new example
-                guid = "%s-%s" % (set_type, enum)
-                examples.append(InputExample(guid=guid, texts=texts, labels=labels))
-                enum += 1
+                if labels:
+                    guid = "%s-%s" % (set_type, enum)
+                    examples.append(InputExample(guid=guid, texts=texts, labels=labels))
+                    enum += 1
                 texts, labels = [], []
             else:
                 if set_type == "test":
@@ -319,6 +321,7 @@ class DiscProcessor(DataProcessor):
                     label = tokenization.convert_to_unicode(line[1])
                 texts.append(text)
                 labels.append(label)
+        print("{} examples founded".format(len(examples)))
         return examples
 
 
@@ -511,23 +514,28 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
 
         # For training, we want a lot of parallel reading and shuffling.
         # For eval, we want no shuffling and parallel reading doesn't matter.
-        dataset = tf.data.TFRecordDataset(input_file)
+        dataset = tf.compat.v1.data.TFRecordDataset(input_file)
         if is_training:
             dataset = dataset.repeat()
             dataset = dataset.shuffle(buffer_size=100)
 
         # 应用批处理batch size
-        dataset = dataset.apply(tf.data.experimental.map_and_batch(
+        ds = dataset.apply(tf.compat.v1.data.experimental.map_and_batch(
             lambda record: _decode_record(record, context_features, sequence_features),
             batch_size=batch_size,
-            drop_remainder=drop_remainder))
+            drop_remainder=drop_remainder,
+            num_parallel_calls=2, )
+        )
 
-        # iterator = dataset.make_one_shot_iterator()
-        # d = iterator.get_next()
+        # 生成一个迭代器
+        # iterator = ds.make_one_shot_iterator()
+        # # 从iterator里取出一个元素
+        # ds = iterator.get_next()
+        ds = ds.prefetch(1)
         # print("dataset={}".format(type(dataset)))
         # print("iterator={}".format(type(iterator)))
         # print("d={}".format(type(d)))
-        return dataset
+        return ds
 
     return input_fn
 
@@ -578,17 +586,19 @@ def create_model(bert_config, is_training, input_ids, sequence_lengths, init_che
     input_ids = tf.reshape(input_ids, [-1, FLAGS.max_token_length])
     # print("2: {} input_ids={}".format(type(input_ids), input_ids.shape))
 
-    inputs = {"input_ids": input_ids, "label_ids": label_ids}
-    model = TFBertMainLayer(
+    model = modeling.BertModel(
         config=bert_config,
-        name="bert-embedding"
-    )
-    _, embedding = model(inputs)
+        is_training=is_training,
+        input_ids=input_ids,
+        use_one_hot_embeddings=use_one_hot_embeddings)
+    embedding = model.get_pooled_output()
 
-    # print("3 input_ids={}".format(input_ids.shape))
-    # hidden_size: 768
-
-    # print("{} embedding".format(embedding.shape))
+    # inputs = {"input_ids": input_ids, "label_ids": label_ids}
+    # model = TFBertMainLayer(
+    #     config=bert_config,
+    #     name="bert-embedding"
+    # )
+    # _, embedding = model(inputs)
 
     hidden_size = embedding.shape[-1]
     max_seq_length = FLAGS.max_seq_length
@@ -614,31 +624,7 @@ def create_model(bert_config, is_training, input_ids, sequence_lengths, init_che
     (loss, per_example_loss, logits, probabilities) = blstm_crf.add_blstm_crf_layer(crf_only=False)
     # print("loss={}, per_example_loss={}, logits={}, probabilities={}".format(loss, per_example_loss, logits,
     #                                                                          probabilities))
-
-    tvars = tf.compat.v1.trainable_variables()
-    initialized_variable_names = {}
-    scaffold_fn = None
-    if init_checkpoint:
-        (assignment_map, initialized_variable_names
-         ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-        if use_tpu:
-
-            def tpu_scaffold():
-                tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
-                return tf.compat.v1.train.Scaffold()
-
-            scaffold_fn = tpu_scaffold
-        else:
-            tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
-    tf.compat.v1.logging.info("**** Trainable Variables ****")
-    for var in tvars:
-        init_string = ""
-        if var.name in initialized_variable_names:
-            init_string = ", *INIT_FROM_CKPT*"
-        tf.compat.v1.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                                  init_string)
-    return (loss, per_example_loss, logits, probabilities, scaffold_fn)
+    return (loss, per_example_loss, logits, probabilities)
 
 
 def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
@@ -694,17 +680,41 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         # print("{} label_ids={}".format(label_ids.shape, label_ids))
 
         # 构建模型网络结构
-        (total_loss, per_example_loss, logits, probabilities, scaffold_fn) = create_model(
+        (total_loss, per_example_loss, logits, probabilities) = create_model(
             bert_config, is_training, input_ids, sequence_lengths, init_checkpoint, label_ids,
             num_labels, use_one_hot_embeddings, use_tpu)
 
+        tvars = tf.compat.v1.trainable_variables()
+        initialized_variable_names = {}
+        scaffold_fn = None
+        if init_checkpoint:
+            (assignment_map, initialized_variable_names
+             ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+            if use_tpu:
+
+                def tpu_scaffold():
+                    tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
+                    return tf.compat.v1.train.Scaffold()
+
+                scaffold_fn = tpu_scaffold
+            else:
+                tf.compat.v1.train.init_from_checkpoint(init_checkpoint, assignment_map)
+
+        # tf.compat.v1.logging.info("**** Trainable Variables ****")
+        # for var in tvars:
+        #     init_string = ""
+        #     if var.name in initialized_variable_names:
+        #         init_string = ", *INIT_FROM_CKPT*"
+        #     tf.compat.v1.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
+        #                               init_string)
+
         # 训练模式
-        if mode == tf.estimator.ModeKeys.TRAIN:
+        if mode == tf.compat.v1.estimator.ModeKeys.TRAIN:
             if FLAGS.num_gpu_cores > 1:
                 train_op = custom_optimization.create_optimizer(
                     total_loss, learning_rate, num_train_steps, num_warmup_steps, fp16=fp16)
 
-                output_spec = tf.estimator.EstimatorSpec(
+                output_spec = tf.compat.v1.estimator.EstimatorSpec(
                     mode=mode,
                     loss=total_loss,
                     train_op=train_op,
@@ -719,7 +729,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                     train_op=train_op,
                     scaffold_fn=scaffold_fn)
         # 评估模式
-        elif mode == tf.estimator.ModeKeys.EVAL:
+        elif mode == tf.compat.v1.estimator.ModeKeys.EVAL:
             def metric_fn(per_example_loss, label_ids, logits, is_real_example):
                 predictions = tf.argmax(input=logits, axis=-1, output_type=tf.int32)
                 accuracy = tf.compat.v1.metrics.accuracy(
@@ -750,7 +760,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
 
             eval_metrics = (metric_fn, [per_example_loss, label_ids, logits, is_real_example])
             if FLAGS.num_gpu_cores > 1:
-                output_spec = tf.estimator.EstimatorSpec(
+                output_spec = tf.compat.v1.estimator.EstimatorSpec(
                     mode=mode,
                     loss=total_loss,
                     eval_metric_ops=metric_fn(per_example_loss, label_ids, logits, is_real_example),
@@ -769,7 +779,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
             predictions = tf.argmax(input=logits, axis=-1, output_type=tf.int32)
             if FLAGS.num_gpu_cores > 1:
                 # 多GPUs
-                output_spec = tf.estimator.EstimatorSpec(
+                output_spec = tf.compat.v1.estimator.EstimatorSpec(
                     mode=mode,
                     predictions={"probabilities": probabilities, "predictions": predictions})
             else:
@@ -817,8 +827,8 @@ def main(_):
         raise ValueError(
             "At least one of `do_train`, `do_eval` or `do_predict' must be True.")
 
-    # bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
-    bert_config = BertConfig()
+    bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+    # bert_config = BertConfig()
     tf.compat.v1.logging.info("bert_config={}".format(bert_config))
 
     if FLAGS.max_seq_length > bert_config.max_position_embeddings:
@@ -894,11 +904,13 @@ def main(_):
         # multi-gpus 训练
         tf.compat.v1.logging.info(f"***** {FLAGS.num_gpu_cores} GPUs Running *****")
         # 1.先定义分布式训练的镜像策略：MirroredStrategy
-        # dist_strategy = tf.contrib.distribute.MirroredStrategy(
-        #     num_gpus=FLAGS.num_gpu_cores,  # 使用gpu的个数
-        #     # cross_device_ops=AllReduceCrossDeviceOps('nccl', num_packs=FLAGS.num_gpu_cores),  # 各设备之间的数据操作方式
-        #     # cross_device_ops=AllReduceCrossDeviceOps('hierarchical_copy'),
-        # )
+        dist_strategy = tf.compat.v1.distribute.MirroredStrategy(
+            devices=[f"/gpu:{str(i)}" for i in range(FLAGS.num_gpu_cores)],
+            cross_device_ops=tf.compat.v1.distribute.HierarchicalCopyAllReduce(num_packs=FLAGS.num_gpu_cores)
+            # num_gpus=FLAGS.num_gpu_cores,  # 使用gpu的个数
+            # cross_device_ops=AllReduceCrossDeviceOps('nccl', num_packs=FLAGS.num_gpu_cores),  # 各设备之间的数据操作方式
+            # cross_device_ops=AllReduceCrossDeviceOps('hierarchical_copy'),
+        )
         # 2.设置会话session配置
         session_config = tf.compat.v1.ConfigProto(
             inter_op_parallelism_threads=0,
@@ -908,14 +920,14 @@ def main(_):
 
         # 3.设置运行配置run_config
         run_config = tf.compat.v1.estimator.tpu.RunConfig(
-            # train_distribute=dist_strategy,
-            # eval_distribute=dist_strategy,
+            train_distribute=dist_strategy,
+            eval_distribute=dist_strategy,
             model_dir=FLAGS.output_dir,
             session_config=session_config,
             save_checkpoints_steps=FLAGS.save_checkpoints_steps,
             keep_checkpoint_max=15)
         # 4.构造CPU、GPU评估器对象
-        estimator = tf.estimator.Estimator(
+        estimator = tf.compat.v1.estimator.Estimator(
             model_fn=model_fn,
             config=run_config,
             params={"batch_size": FLAGS.train_batch_size})
@@ -963,46 +975,9 @@ def main(_):
             seq_length=FLAGS.max_seq_length,
             is_training=True,
             drop_remainder=True, num_labels=len(label_list))
-        # ------------- 2.Eval ------------- #
-        eval_examples = processor.get_dev_examples(FLAGS.data_dir)
-        num_actual_eval_examples = len(eval_examples)
-        if FLAGS.use_tpu:
-            # TPU requires a fixed batch size for all batches, therefore the number
-            # of examples must be a multiple of the batch size, or else examples
-            # will get dropped. So we pad with fake examples which are ignored
-            # later on. These do NOT count towards the metric (all tf.metrics
-            # support a per-instance weight, and these get a weight of 0.0).
-            while len(eval_examples) % FLAGS.eval_batch_size != 0:
-                eval_examples.append(PaddingInputExample())
-
-        eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
-        file_based_convert_examples_to_features(
-            eval_examples, label_map, FLAGS.max_seq_length, FLAGS.max_token_length, tokenizer, eval_file)
-
-        tf.compat.v1.logging.info("***** Running evaluation *****")
-        tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
-                                  len(eval_examples), num_actual_eval_examples,
-                                  len(eval_examples) - num_actual_eval_examples)
-        tf.compat.v1.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
-
-        # This tells the estimator to run through the entire set.
-        eval_steps = None
-        # However, if running eval on the TPU, you will need to specify the
-        # number of steps.
-        if FLAGS.use_tpu:
-            assert len(eval_examples) % FLAGS.eval_batch_size == 0
-            eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
-
-        eval_drop_remainder = True if FLAGS.use_tpu else False
-        eval_input_fn = file_based_input_fn_builder(
-            input_file=eval_file,
-            seq_length=FLAGS.max_seq_length,
-            is_training=False,
-            drop_remainder=eval_drop_remainder, num_labels=len(label_list))
-
         if FLAGS.do_early_stopping:
             # 1.3 early stopping
-            early_stopping_hook = tf.estimator.experimental.stop_if_no_decrease_hook(
+            early_stopping_hook = tf.compat.v1.estimator.experimental.stop_if_no_decrease_hook(
                 estimator=estimator,
                 metric_name='eval_loss',
                 max_steps_without_decrease=FLAGS.max_steps_without_decrease,
@@ -1010,15 +985,98 @@ def main(_):
                 min_steps=FLAGS.min_steps,
                 run_every_secs=None,
                 run_every_steps=FLAGS.save_checkpoints_steps)
-            train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps,
-                                                hooks=[early_stopping_hook])
-            eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps, throttle_secs=0)
+            train_spec = tf.compat.v1.estimator.TrainSpec(input_fn=train_input_fn, max_steps=num_train_steps,
+                                                          hooks=[early_stopping_hook])
+            # ------------- 2.Eval ------------- #
+            eval_examples = processor.get_dev_examples(FLAGS.data_dir)
+            num_actual_eval_examples = len(eval_examples)
+            if FLAGS.use_tpu:
+                # TPU requires a fixed batch size for all batches, therefore the number
+                # of examples must be a multiple of the batch size, or else examples
+                # will get dropped. So we pad with fake examples which are ignored
+                # later on. These do NOT count towards the metric (all tf.metrics
+                # support a per-instance weight, and these get a weight of 0.0).
+                while len(eval_examples) % FLAGS.eval_batch_size != 0:
+                    eval_examples.append(PaddingInputExample())
+
+            eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
+            file_based_convert_examples_to_features(
+                eval_examples, label_map, FLAGS.max_seq_length, FLAGS.max_token_length, tokenizer, eval_file)
+
+            tf.compat.v1.logging.info("***** Running evaluation *****")
+            tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
+                                      len(eval_examples), num_actual_eval_examples,
+                                      len(eval_examples) - num_actual_eval_examples)
+            tf.compat.v1.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+
+            # This tells the estimator to run through the entire set.
+            eval_steps = None
+            # However, if running eval on the TPU, you will need to specify the
+            # number of steps.
+            if FLAGS.use_tpu:
+                assert len(eval_examples) % FLAGS.eval_batch_size == 0
+                eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
+
+            eval_drop_remainder = True if FLAGS.use_tpu else False
+            eval_input_fn = file_based_input_fn_builder(
+                input_file=eval_file,
+                seq_length=FLAGS.max_seq_length,
+                is_training=False,
+                drop_remainder=eval_drop_remainder, num_labels=len(label_list))
+            eval_spec = tf.compat.v1.estimator.EvalSpec(input_fn=eval_input_fn, steps=eval_steps, throttle_secs=0)
 
             tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
             tf.compat.v1.logging.info("***** Training & Evaluating completed*****")
         else:
+            # 1.train
             estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
             tf.compat.v1.logging.info("***** Training completed*****")
+
+            # 2.evaluation
+            eval_examples = processor.get_dev_examples(FLAGS.data_dir)
+            num_actual_eval_examples = len(eval_examples)
+            if FLAGS.use_tpu:
+                # TPU requires a fixed batch size for all batches, therefore the number
+                # of examples must be a multiple of the batch size, or else examples
+                # will get dropped. So we pad with fake examples which are ignored
+                # later on. These do NOT count towards the metric (all tf.metrics
+                # support a per-instance weight, and these get a weight of 0.0).
+                while len(eval_examples) % FLAGS.eval_batch_size != 0:
+                    eval_examples.append(PaddingInputExample())
+            eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
+            file_based_convert_examples_to_features(
+                eval_examples, label_map, FLAGS.max_seq_length, FLAGS.max_token_length, tokenizer, eval_file)
+
+            tf.compat.v1.logging.info("***** Running evaluation *****")
+            tf.compat.v1.logging.info("  Num examples = %d (%d actual, %d padding)",
+                                      len(eval_examples), num_actual_eval_examples,
+                                      len(eval_examples) - num_actual_eval_examples)
+            tf.compat.v1.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+
+            # This tells the estimator to run through the entire set.
+            eval_steps = None
+            # However, if running eval on the TPU, you will need to specify the
+            # number of steps.
+            if FLAGS.use_tpu:
+                assert len(eval_examples) % FLAGS.eval_batch_size == 0
+                eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
+
+            eval_drop_remainder = True if FLAGS.use_tpu else False
+            eval_input_fn = file_based_input_fn_builder(
+                input_file=eval_file,
+                seq_length=FLAGS.max_seq_length,
+                is_training=False,
+                drop_remainder=eval_drop_remainder, num_labels=len(label_list))
+
+            result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
+
+            output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
+            with tf.io.gfile.GFile(output_eval_file, "w") as writer:
+                tf.compat.v1.logging.info("***** Eval results *****")
+                for key in sorted(result.keys()):
+                    tf.compat.v1.logging.info("  %s = %s", key, str(result[key]))
+                    writer.write("%s = %s\n" % (key, str(result[key])))
+            tf.compat.v1.logging.info("***** Evaluation completed*****")
 
         # export SavedModel format for TF serving
         export_dir_base = os.path.join(FLAGS.output_dir, 'saved_model')
